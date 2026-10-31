@@ -1,9 +1,10 @@
-workflows:
+﻿workflows:
   ios-unsigned:
     name: Build unsigned IPA
     max_build_duration: 120
 
     environment:
+      xcode: 16.4
       vars:
         PAYLOAD_URL: "https://github.com/sxh1287056665/mgbuster-ios/releases/download/unity-payload/Unity-iPhone-xcode.tar.gz"
 
@@ -32,17 +33,17 @@ workflows:
           cd "$CM_BUILD_DIR/xcode/iOS"
           PBX="Unity-iPhone.xcodeproj/project.pbxproj"
 
-          # 1) 关闭 bitcode（Xcode 14+ 已移除该特性）
+          # 1) 鍏抽棴 bitcode锛圶code 14+ 宸茬Щ闄よ鐗规€э級
           /usr/bin/sed -i '' 's/ENABLE_BITCODE = YES;/ENABLE_BITCODE = NO;/g' "$PBX"
 
-          # 2) 统一最低系统版本，规避 libarclite 缺失
+          # 2) 缁熶竴鏈€浣庣郴缁熺増鏈紝瑙勯伩 libarclite 缂哄け
           /usr/bin/sed -i '' 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9][0-9.]*;/IPHONEOS_DEPLOYMENT_TARGET = 12.0;/g' "$PBX"
 
-          # 3) 移除 -mno-thumb：Unity 2019.4 为 ARMv7 生成，新版 clang 在 arm64 目标上拒绝该选项
+          # 3) 绉婚櫎 -mno-thumb锛歎nity 2019.4 涓?ARMv7 鐢熸垚锛屾柊鐗?clang 鍦?arm64 鐩爣涓婃嫆缁濊閫夐」
           /usr/bin/sed -i '' '/"-mno-thumb",/d' "$PBX"
           /usr/bin/sed -i '' 's/GCC_THUMB_SUPPORT = NO;/GCC_THUMB_SUPPORT = YES;/g' "$PBX"
 
-          # 4) 恢复可执行位：Windows 打包时丢失，导致 Run Script 阶段 Permission denied
+          # 4) 鎭㈠鍙墽琛屼綅锛歐indows 鎵撳寘鏃朵涪澶憋紝瀵艰嚧 Run Script 闃舵 Permission denied
           find . -name '*.sh' -type f -print -exec chmod 755 {} \;
           chmod 755 MapFileParser.sh process_symbols.sh 2>/dev/null || true
 
