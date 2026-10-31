@@ -31,8 +31,20 @@ workflows:
           set -e
           cd "$CM_BUILD_DIR/xcode/iOS"
           PBX="Unity-iPhone.xcodeproj/project.pbxproj"
+
+          # 1) 关闭 bitcode（Xcode 14+ 已移除）
           /usr/bin/sed -i '' 's/ENABLE_BITCODE = YES;/ENABLE_BITCODE = NO;/g' "$PBX"
+
+          # 2) 统一最低系统版本，规避 libarclite 缺失
           /usr/bin/sed -i '' 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9][0-9.]*;/IPHONEOS_DEPLOYMENT_TARGET = 12.0;/g' "$PBX"
+
+          # 3) 恢复可执行位：Windows 打包时丢失，导致 Run Script 阶段 Permission denied
+          find . -name '*.sh' -type f -print -exec chmod 755 {} \;
+          chmod 755 MapFileParser.sh process_symbols.sh 2>/dev/null || true
+
+          echo "--- permission check ---"
+          ls -l MapFileParser.sh process_symbols.sh
+
           echo "ENABLE_BITCODE=NO occurrences: $(grep -c 'ENABLE_BITCODE = NO;' "$PBX" || true)"
           echo "deployment targets:"
           grep -o 'IPHONEOS_DEPLOYMENT_TARGET = [0-9.]*;' "$PBX" | sort -u
