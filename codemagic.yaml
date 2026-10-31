@@ -75,17 +75,36 @@ workflows:
       - name: Package unsigned IPA
         script: |
           set -e
-          APP="$CM_BUILD_DIR/build/Unity-iPhone.xcarchive/Products/Applications/Unity-iPhone.app"
-          test -d "$APP"
+          ARCH="$CM_BUILD_DIR/build/Unity-iPhone.xcarchive"
+          APPS="$ARCH/Products/Applications"
+          echo "--- apps in archive ---"
+          ls -la "$APPS"
+
+          APP=$(find "$APPS" -maxdepth 1 -name '*.app' -type d | head -n 1)
+          if [ -z "$APP" ]; then
+            echo "ERROR: no .app found in $APPS"
+            exit 1
+          fi
+          echo "APP=$APP"
+          du -sh "$APP"
+
           cd "$CM_BUILD_DIR/build"
+          rm -rf Payload
           mkdir -p Payload
           cp -R "$APP" Payload/
+          APPNAME=$(basename "$APP")
+          echo "APPNAME=$APPNAME"
+
           zip -qry MGBuster-unsigned.ipa Payload
           ls -lh MGBuster-unsigned.ipa
+          unzip -l MGBuster-unsigned.ipa | head -n 15
+
           echo "--- app info ---"
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' Payload/Unity-iPhone.app/Info.plist || true
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Payload/Unity-iPhone.app/Info.plist || true
-          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' Payload/Unity-iPhone.app/Info.plist || true
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "Payload/$APPNAME/Info.plist" || true
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "Payload/$APPNAME/Info.plist" || true
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "Payload/$APPNAME/Info.plist" || true
+          echo "--- binary arch ---"
+          lipo -info "Payload/$APPNAME/$APPNAME" 2>/dev/null || file "Payload/$APPNAME/$APPNAME" || true
 
     artifacts:
       - build/MGBuster-unsigned.ipa
