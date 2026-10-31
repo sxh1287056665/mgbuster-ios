@@ -1,0 +1,97 @@
+name: Build unsigned IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch Unity Xcode project
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/xcode"
+          gh release download unity-payload \
+            --repo "${{ github.repository }}" \
+            --pattern 'Unity-iPhone-xcode.tar.gz' \
+            --output "$RUNNER_TEMP/payload.tar.gz" \
+            --clobber
+          ls -lh "$RUNNER_TEMP/payload.tar.gz"
+          tar -xzf "$RUNNER_TEMP/payload.tar.gz" -C "$RUNNER_TEMP/xcode"
+          echo "--- extracted ---"
+          ls -la "$RUNNER_TEMP/xcode"
+
+      - name: Show Xcode version
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Patch project for modern Xcode
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/xcode/iOS"
+          PBX="Unity-iPhone.xcodeproj/project.pbxproj"
+          /usr/bin/sed -i '' 's/ENABLE_BITCODE = YES;/ENABLE_BITCODE = NO;/g' "$PBX"
+          /usr/bin/sed -i '' 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9][0-9.]*;/IPHONEOS_DEPLOYMENT_TARGET = 12.0;/g' "$PBX"
+          echo "ENABLE_BITCODE=NO count: $(grep -c 'ENABLE_BITCODE = NO;' "$PBX" || true)"
+          echo "DEPLOYMENT_TARGET lines:"
+          grep -o 'IPHONEOS_DEPLOYMENT_TARGET = [0-9.]*;' "$PBX" | sort -u
+
+      - name: Archive
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/xcode/iOS"
+          set -o pipefail
+          xcodebuild \
+            -project Unity-iPhone.xcodeproj \
+            -scheme Unity-iPhone \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/build/Unity-iPhone.xcarchive" \
+            archive \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            ENABLE_BITCODE=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            2>&1 | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          retention-days: 7
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/build/Unity-iPhone.xcarchive/Products/Applications/Unity-iPhone.app"
+          test -d "$APP"
+          mkdir -p "$RUNNER_TEMP/build/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/build/Payload/"
+          cd "$RUNNER_TEMP/build"
+          zip -qry MGBuster-unsigned.ipa Payload
+          ls -lh MGBuster-unsigned.ipa
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' Payload/Unity-iPhone.app/Info.plist || true
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Payload/Unity-iPhone.app/Info.plist || true
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' Payload/Unity-iPhone.app/Info.plist || true
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: MGBuster-unsigned-ipa
+          path: ${{ runner.temp }}/build/MGBuster-unsigned.ipa
+          retention-days: 7
