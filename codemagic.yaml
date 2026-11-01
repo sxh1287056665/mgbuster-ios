@@ -1,112 +1,76 @@
-﻿workflows:
-  ios-unsigned:
-    name: Build unsigned IPA
-    max_build_duration: 120
-
+workflows:
+  ios-link-test:
+    name: SiNiSistar2 iOS link test
+    instance_type: mac_mini_m2
+    max_build_duration: 60
     environment:
       xcode: 16.4
       vars:
-        PAYLOAD_URL: "https://github.com/sxh1287056665/mgbuster-ios/releases/download/unity-payload/Unity-iPhone-xcode.tar.gz"
-
+        PAYLOAD_URL: "https://github.com/sxh1287056665/mgbuster-ios/releases/download/unity-ios-linktest/unity-ios-payload.zip"
     scripts:
-      - name: Show toolchain
-        script: |
-          xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-version
-          sw_vers
-
-      - name: Fetch Unity Xcode project
+      - name: Fetch payload
         script: |
           set -e
           cd "$CM_BUILD_DIR"
-          curl -L --retry 5 --retry-delay 5 -o payload.tar.gz "$PAYLOAD_URL"
-          ls -lh payload.tar.gz
-          mkdir -p xcode
-          tar -xzf payload.tar.gz -C xcode
-          echo "--- top level ---"
-          ls -la xcode
-          du -sh xcode/iOS
+          echo "--- downloading payload ---"
+          curl -L --retry 3 --retry-delay 5 -o payload.zip "$PAYLOAD_URL"
+          ls -la payload.zip
+          echo "--- unpacking ---"
+          unzip -q payload.zip -d .
+          echo "--- tree ---"
+          ls -la
+          du -sh Libraries Frameworks 2>/dev/null || true
+          echo "--- engine + dylib sizes ---"
+          ls -l Libraries/libiPhone-lib.a Frameworks/GameAssembly.dylib
 
-      - name: Patch project for modern Xcode
+      - name: Verify GameAssembly.dylib
         script: |
           set -e
-          cd "$CM_BUILD_DIR/xcode/iOS"
-          PBX="Unity-iPhone.xcodeproj/project.pbxproj"
+          cd "$CM_BUILD_DIR"
+          echo "=== Mach-O header ==="
+          otool -hv Frameworks/GameAssembly.dylib | sed -n '2,3p'
+          echo "=== build version (expect platform IOS) ==="
+          vtool -show-build Frameworks/GameAssembly.dylib || true
+          echo "=== linked dylibs ==="
+          otool -L Frameworks/GameAssembly.dylib
+          echo "=== exported il2cpp_ symbols (expect 241) ==="
+          nm -gU Frameworks/GameAssembly.dylib | grep -c '_il2cpp_' || echo 0
 
-          # 1) 鍏抽棴 bitcode锛圶code 14+ 宸茬Щ闄よ鐗规€э級
-          /usr/bin/sed -i '' 's/ENABLE_BITCODE = YES;/ENABLE_BITCODE = NO;/g' "$PBX"
-
-          # 2) 缁熶竴鏈€浣庣郴缁熺増鏈紝瑙勯伩 libarclite 缂哄け
-          /usr/bin/sed -i '' 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9][0-9.]*;/IPHONEOS_DEPLOYMENT_TARGET = 12.0;/g' "$PBX"
-
-          # 3) 绉婚櫎 -mno-thumb锛歎nity 2019.4 涓?ARMv7 鐢熸垚锛屾柊鐗?clang 鍦?arm64 鐩爣涓婃嫆缁濊閫夐」
-          /usr/bin/sed -i '' '/"-mno-thumb",/d' "$PBX"
-          /usr/bin/sed -i '' 's/GCC_THUMB_SUPPORT = NO;/GCC_THUMB_SUPPORT = YES;/g' "$PBX"
-
-          # 4) 鎭㈠鍙墽琛屼綅锛歐indows 鎵撳寘鏃朵涪澶憋紝瀵艰嚧 Run Script 闃舵 Permission denied
-          find . -name '*.sh' -type f -print -exec chmod 755 {} \;
-          chmod 755 MapFileParser.sh process_symbols.sh 2>/dev/null || true
-
-          echo "--- checks ---"
-          echo "bitcode_NO: $(grep -c 'ENABLE_BITCODE = NO;' "$PBX" || true)"
-          echo "mno_thumb_left: $(grep -c 'mno-thumb' "$PBX" || true)"
-          echo "deployment_targets:"
-          grep -o 'IPHONEOS_DEPLOYMENT_TARGET = [0-9.]*;' "$PBX" | sort -u
-          ls -l MapFileParser.sh process_symbols.sh
-
-      - name: Archive
+      - name: Verify engine contract
         script: |
           set -e
-          cd "$CM_BUILD_DIR/xcode/iOS"
-          mkdir -p "$CM_BUILD_DIR/build"
-          xcodebuild \
-            -project Unity-iPhone.xcodeproj \
-            -scheme Unity-iPhone \
-            -configuration Release \
-            -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
-            -archivePath "$CM_BUILD_DIR/build/Unity-iPhone.xcarchive" \
-            archive \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            ENABLE_BITCODE=NO \
-            COMPILER_INDEX_STORE_ENABLE=NO
+          cd "$CM_BUILD_DIR"
+          echo "=== engine undefined il2cpp_ symbols (expect 155) ==="
+          nm -u Libraries/libiPhone-lib.a 2>/dev/null | grep '_il2cpp' | awk '{print $NF}' | sort -u | wc -l || echo 0
+          echo "=== first 20 ==="
+          nm -u Libraries/libiPhone-lib.a 2>/dev/null | grep '_il2cpp' | awk '{print $NF}' | sort -u | head -20 || true
 
-      - name: Package unsigned IPA
+      - name: Build UnityFramework
         script: |
           set -e
-          ARCH="$CM_BUILD_DIR/build/Unity-iPhone.xcarchive"
-          APPS="$ARCH/Products/Applications"
-          echo "--- apps in archive ---"
-          ls -la "$APPS"
-
-          APP=$(find "$APPS" -maxdepth 1 -name '*.app' -type d | head -n 1)
-          if [ -z "$APP" ]; then
-            echo "ERROR: no .app found in $APPS"
+          cd "$CM_BUILD_DIR"
+          chmod +x build_ios.sh
+          ./build_ios.sh 2>&1 | tail -120 || {
+            echo "===================== BUILD FAILED ====================="
+            echo "--- last 250 lines of build.log ---"
+            tail -250 out/build.log 2>/dev/null || true
+            echo "--- grep for linker errors ---"
+            grep -iE 'undefined symbol|duplicate symbol|error:|ld: ' out/build.log 2>/dev/null | head -80 || true
             exit 1
-          fi
-          echo "APP=$APP"
-          du -sh "$APP"
+          }
 
-          cd "$CM_BUILD_DIR/build"
-          rm -rf Payload
-          mkdir -p Payload
-          cp -R "$APP" Payload/
-          APPNAME=$(basename "$APP")
-          echo "APPNAME=$APPNAME"
-
-          zip -qry MGBuster-unsigned.ipa Payload
-          ls -lh MGBuster-unsigned.ipa
-          unzip -l MGBuster-unsigned.ipa | head -n 15
-
-          echo "--- app info ---"
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "Payload/$APPNAME/Info.plist" || true
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "Payload/$APPNAME/Info.plist" || true
-          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "Payload/$APPNAME/Info.plist" || true
-          echo "--- binary arch ---"
-          lipo -info "Payload/$APPNAME/$APPNAME" 2>/dev/null || file "Payload/$APPNAME/$APPNAME" || true
-
+      - name: Report
+        script: |
+          set -e
+          cd "$CM_BUILD_DIR"
+          echo "=== produced binaries ==="
+          find out -name 'UnityFramework' -type f 2>/dev/null | while read f; do
+            echo "--- $f"
+            ls -lh "$f"
+            lipo -info "$f" || true
+          done
+          find out -name '*.app' -maxdepth 5 2>/dev/null | head
     artifacts:
-      - build/MGBuster-unsigned.ipa
-      - xcode/iOS/*.log
+      - out/build.log
+      - out/**/UnityFramework
+      - out/**/*.app
