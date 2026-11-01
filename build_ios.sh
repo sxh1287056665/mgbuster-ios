@@ -55,7 +55,7 @@ for f in \
     "$PAYLOAD/Libraries/baselib.a" \
     "$PAYLOAD/Frameworks/GameAssembly.dylib" \
     "$PAYLOAD/Classes/UnityNoExceptionsStub.c" \
-    "$PAYLOAD/Classes/Native/pch-cpp.hpp"
+    "$PAYLOAD/Classes/pch-cpp.hpp"
 do
     if [ -e "$f" ]; then
         log "   ok   $(printf '%-42s' "${f#$PAYLOAD/}") $(du -h "$f" | cut -f1)"
@@ -92,6 +92,12 @@ DYLIB="$PAYLOAD/Frameworks/GameAssembly.dylib"
 ENGINE="$PAYLOAD/Libraries/libiPhone-lib.a"
 LDFLAGS="-ObjC -Wl,-force_load,$ENGINE $DYLIB -Wl,-search_paths_first"
 
+# Unity writes UNITY_VERSION_* into the pbxproj at build time; the Trampoline
+# template ships with zero occurrences. They are checked by the C preprocessor
+# (UnityTrampolineConfigure.h:8), so they must go into GCC_PREPROCESSOR_DEFINITIONS
+# as -D style defines - passing them as bare build settings does nothing.
+DEFINES="\$(inherited) UNITY_VERSION_VER=$UNITY_VER UNITY_VERSION_MAJ=$UNITY_MAJ UNITY_VERSION_MIN=$UNITY_MIN"
+
 set -x
 xcodebuild \
     -project Unity-iPhone.xcodeproj \
@@ -106,9 +112,7 @@ xcodebuild \
     SYMROOT="$SYMROOT" \
     OBJROOT="$OUT/obj" \
     VALIDATE_PRODUCT=NO \
-    UNITY_VERSION_VER="$UNITY_VER" \
-    UNITY_VERSION_MAJ="$UNITY_MAJ" \
-    UNITY_VERSION_MIN="$UNITY_MIN" \
+    GCC_PREPROCESSOR_DEFINITIONS="$DEFINES" \
     OTHER_LDFLAGS="$LDFLAGS" \
     2>&1 | tee -a "$LOG"
 rc=${PIPESTATUS[0]}
