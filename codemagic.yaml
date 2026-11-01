@@ -88,9 +88,11 @@ workflows:
           echo "--- rpaths ---"
           otool -l "$APP/Frameworks/UnityFramework.framework/UnityFramework" | grep -A2 LC_RPATH | grep path || true
           echo
-          echo "=== embedded GameAssembly.dylib ==="
-          ls -lh "$APP/Frameworks/GameAssembly.dylib"
-          otool -D "$APP/Frameworks/GameAssembly.dylib"
+          echo "=== embedded GameAssembly framework ==="
+          ls -lR "$APP/Frameworks/GameAssembly.framework"
+          otool -D "$APP/Frameworks/GameAssembly.framework/GameAssembly"
+          echo "--- signature ---"
+          codesign -dv "$APP/Frameworks/GameAssembly.framework" 2>&1 | head -8 || true
           echo
           echo "=== Info.plist ==="
           plutil -p "$APP/Info.plist"
