@@ -123,6 +123,11 @@ cd "$PAYLOAD"
 
 DYLIB="$FWROOT/GameAssembly.dylib"
 ENGINE="$PAYLOAD/Libraries/libiPhone-lib.a"
+# Unity leaves $(OTHER_LDFLAGS_FRAMEWORK) undefined in the template and references
+# it only from the UnityFramework target's OTHER_LDFLAGS. Passing the engine and
+# dylib through that variable scopes them to the framework: OTHER_LDFLAGS itself
+# applies to every target, which would force-load the 196 MB engine into the app
+# binary as well - two engine copies in one process.
 LDFLAGS="-ObjC -Wl,-force_load,$ENGINE $STUB/libUnityGeneratedStubs.a $DYLIB -Wl,-search_paths_first"
 
 # Unity writes UNITY_VERSION_* into the pbxproj at build time; the Trampoline
@@ -148,7 +153,7 @@ xcodebuild \
     PRODUCT_NAME_APP="$APP_NAME" \
     PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
     GCC_PREPROCESSOR_DEFINITIONS="$DEFINES" \
-    OTHER_LDFLAGS="$LDFLAGS" \
+    OTHER_LDFLAGS_FRAMEWORK="$LDFLAGS" \
     2>&1 | tee -a "$LOG"
 rc=${PIPESTATUS[0]}
 set +x
