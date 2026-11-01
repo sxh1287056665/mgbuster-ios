@@ -103,25 +103,65 @@ xcrun --sdk iphoneos libtool -static -o "$STUB/libUnityGeneratedStubs.a" "$STUB/
 log "   libUnityGeneratedStubs.a $(du -h "$STUB/libUnityGeneratedStubs.a" | cut -f1)  (RegisterAllClasses etc.)"
 
 log ""
-log "== 4. retarget GameAssembly.dylib for the bundle =="
-# The dylib's install name still points at the Mac build tree
-# (Library/Bee/artifacts/.../GameAssembly.dylib), which cannot resolve on a
-# device. Rewrite it to @rpath so the framework's existing
-# @executable_path/Frameworks rpath finds it inside the .app.
+log "== 4. repackage GameAssembly.dylib as a framework =="
+# Two problems with shipping it as a loose .dylib:
+#   - its install name points at the Mac build tree, which cannot resolve on device
+#   - signing tools walk .app and .framework recursively but routinely skip loose
+#     .dylib files, leaving unsigned nested code that iOS refuses to install
+# Wrapping it in a framework fixes both, and makes it a standard target for
+# codesign --deep.
 FWROOT="$OUT/frameworks"
-mkdir -p "$FWROOT"
-cp "$PAYLOAD/Frameworks/GameAssembly.dylib" "$FWROOT/GameAssembly.dylib"
-ORIG_ID=$(otool -D "$FWROOT/GameAssembly.dylib" | tail -n +2)
-log "   old install name: $ORIG_ID"
-install_name_tool -id "@rpath/GameAssembly.dylib" "$FWROOT/GameAssembly.dylib" \
+GAFW="$FWROOT/GameAssembly.framework"
+mkdir -p "$GAFW"
+cp "$PAYLOAD/Frameworks/GameAssembly.dylib" "$GAFW/GameAssembly"
+chmod 755 "$GAFW/GameAssembly"
+
+# The macOS build's signature is invalidated the moment the install name changes.
+# Strip it rather than leave a stale blob behind.
+log "   old install name: $(otool -D "$GAFW/GameAssembly" | tail -n +2)"
+codesign --remove-signature "$GAFW/GameAssembly" 2>/dev/null || true
+install_name_tool -id "@rpath/GameAssembly.framework/GameAssembly" "$GAFW/GameAssembly" \
     || { log "install_name_tool failed"; exit 1; }
-log "   new install name: $(otool -D "$FWROOT/GameAssembly.dylib" | tail -n +2)"
+log "   new install name: $(otool -D "$GAFW/GameAssembly" | tail -n +2)"
+
+cat > "$GAFW/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>GameAssembly</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.jskf95zone.sinisistar2.gameassembly</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>GameAssembly</string>
+	<key>CFBundlePackageType</key>
+	<string>FMWK</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>MinimumOSVersion</key>
+	<string>12.0</string>
+</dict>
+</plist>
+PLIST
+
+# Ad-hoc signature so the framework is internally consistent even before the
+# consumer re-signs the app. codesign --deep replaces this with their identity.
+codesign --force --sign - --timestamp=none "$GAFW" 2>/dev/null \
+    && log "   ad-hoc signed GameAssembly.framework" \
+    || log "   WARNING: ad-hoc signing failed (consumer must sign nested code)"
 
 log ""
 log "== 5. build =="
 cd "$PAYLOAD"
 
-DYLIB="$FWROOT/GameAssembly.dylib"
+DYLIB="$GAFW/GameAssembly"
 ENGINE="$PAYLOAD/Libraries/libiPhone-lib.a"
 # Unity leaves $(OTHER_LDFLAGS_FRAMEWORK) undefined in the template and references
 # it only from the UnityFramework target's OTHER_LDFLAGS. Passing the engine and
@@ -170,10 +210,11 @@ log "================ BUILD OK ================"
 APP="$SYMROOT/Release-iphoneos/$APP_NAME.app"
 [ -d "$APP" ] || { log "app not found at $APP"; ls -la "$SYMROOT/Release-iphoneos"; exit 1; }
 
-# dyld resolves @rpath/GameAssembly.dylib here
+# dyld resolves @rpath/GameAssembly.framework/GameAssembly here
 mkdir -p "$APP/Frameworks"
-cp "$FWROOT/GameAssembly.dylib" "$APP/Frameworks/GameAssembly.dylib"
-log "   embedded GameAssembly.dylib -> $APP/Frameworks/GameAssembly.dylib"
+rm -rf "$APP/Frameworks/GameAssembly.framework" "$APP/Frameworks/GameAssembly.dylib"
+cp -R "$GAFW" "$APP/Frameworks/GameAssembly.framework"
+log "   embedded -> $APP/Frameworks/GameAssembly.framework/GameAssembly"
 
 log ""
 log "== 6. app bundle =="
