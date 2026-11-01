@@ -152,14 +152,13 @@ cat > "$GAFW/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-# Ad-hoc signature so the framework is internally consistent even before the
-# consumer re-signs the app. codesign --deep replaces this with their identity.
-codesign --force --sign - --timestamp=none "$GAFW/GameAssembly" 2>&1 | sed 's/^/     /' | tee -a "$LOG"
-if codesign --verify --verbose=1 "$GAFW/GameAssembly" 2>&1 | sed 's/^/     /' | tee -a "$LOG"; then
-    log "   ad-hoc signature valid"
-else
-    log "   WARNING: ad-hoc signature did not verify"
-fi
+# Deliberately left UNSIGNED. An ad-hoc signature here would drop a
+# _CodeSignature/CodeResources seal computed over the ad-hoc identity; a signing
+# tool that re-signs only the binary and leaves that seal in place produces a
+# bundle whose seal does not match, and iOS rejects the whole install. Shipping
+# no signature at all lets the consumer's tool build the seal from scratch.
+rm -rf "$GAFW/_CodeSignature"
+log "   shipped unsigned (no _CodeSignature) - consumer signs the bundle"
 
 log ""
 log "== 5. build =="
