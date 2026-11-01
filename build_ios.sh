@@ -95,12 +95,28 @@ cp "$STUB/libGameAssembly.a" "$SYMROOT/Release-iphoneos/libGameAssembly.a"
 log "   placed $SYMROOT/Release-iphoneos/libGameAssembly.a ($(du -h "$STUB/libGameAssembly.a" | cut -f1))"
 
 log ""
+log "== 3b. generated-registration stubs =="
+# The engine references three functions that Unity generates into
+# libGameAssembly.a. We compile none, so they are supplied here and archived
+# into their own library. They are compiled separately rather than added to the
+# Xcode target's Sources phase to keep project.pbxproj untouched.
+xcrun --sdk iphoneos clang++ -arch arm64 -mios-version-min=11.0 -O2 -std=c++17 \
+    -c "$PAYLOAD/Libraries/UnityGeneratedStubs.cpp" -o "$STUB/UnityGeneratedStubs.o" \
+    || { log "generated-stub compile failed"; exit 1; }
+xcrun --sdk iphoneos libtool -static -o "$STUB/libUnityGeneratedStubs.a" \
+    "$STUB/UnityGeneratedStubs.o" || { log "generated-stub archive failed"; exit 1; }
+log "   libUnityGeneratedStubs.a $(du -h "$STUB/libUnityGeneratedStubs.a" | cut -f1)"
+log "   provides: RegisterStaticallyLinkedModulesGranular (C),"
+log "             RegisterAllClasses / RegisterAllStrippedInternalCalls (C++)"
+
+log ""
 log "== 4. linking =="
 cd "$PAYLOAD"
 
 DYLIB="$PAYLOAD/Frameworks/GameAssembly.dylib"
 ENGINE="$PAYLOAD/Libraries/libiPhone-lib.a"
-LDFLAGS="-ObjC -Wl,-force_load,$ENGINE $DYLIB -Wl,-search_paths_first"
+GENSTUB="$STUB/libUnityGeneratedStubs.a"
+LDFLAGS="-ObjC -Wl,-force_load,$ENGINE $GENSTUB $DYLIB -Wl,-search_paths_first"
 
 # Unity writes UNITY_VERSION_* into the pbxproj at build time; the Trampoline
 # template ships with zero occurrences. They are checked by the C preprocessor
