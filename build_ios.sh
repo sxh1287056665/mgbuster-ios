@@ -147,6 +147,8 @@ cat > "$GAFW/Info.plist" <<'PLIST'
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>GameAssembly</string>
 	<key>CFBundleExecutable</key>
 	<string>GameAssembly</string>
 	<key>CFBundleIdentifier</key>
@@ -159,10 +161,25 @@ cat > "$GAFW/Info.plist" <<'PLIST'
 	<string>FMWK</string>
 	<key>CFBundleShortVersionString</key>
 	<string>1.0</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>iPhoneOS</string>
+	</array>
 	<key>CFBundleVersion</key>
 	<string>1</string>
+	<key>DTCompiler</key>
+	<string>com.apple.compilers.llvm.clang.1_0</string>
+	<key>DTPlatformName</key>
+	<string>iphoneos</string>
+	<key>DTSDKName</key>
+	<string>iphoneos</string>
 	<key>MinimumOSVersion</key>
 	<string>12.0</string>
+	<key>UIDeviceFamily</key>
+	<array>
+		<integer>1</integer>
+		<integer>2</integer>
+	</array>
 </dict>
 </plist>
 PLIST
@@ -234,8 +251,42 @@ rm -rf "$APP/Frameworks/GameAssembly.framework" "$APP/Frameworks/GameAssembly.dy
 cp -R "$GAFW" "$APP/Frameworks/GameAssembly.framework"
 log "   embedded -> $APP/Frameworks/GameAssembly.framework/GameAssembly"
 
+# PRODUCT_BUNDLE_IDENTIFIER is a global xcodebuild setting: it applies to every
+# target, so passing $BUNDLE_ID on the command line also stamped it onto
+# UnityFramework.framework and collided with the app's own identifier. iOS
+# refuses to install a bundle in which a nested framework shares the host app's
+# CFBundleIdentifier, and the failure surfaces as a generic "cannot install"
+# with no diagnostic. Restore a distinct identifier for the framework.
+UFW_PLIST="$APP/Frameworks/UnityFramework.framework/Info.plist"
+if [ -f "$UFW_PLIST" ]; then
+    CUR=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$UFW_PLIST" 2>/dev/null || echo "")
+    log "   UnityFramework id before: $CUR"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID.framework" "$UFW_PLIST" \
+        || { log "failed to rewrite UnityFramework bundle id"; exit 1; }
+    log "   UnityFramework id after : $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$UFW_PLIST")"
+else
+    log "WARNING: $UFW_PLIST missing"
+fi
+
 log ""
 log "== 6. app bundle =="
+log "   -- bundle identifiers (must all be distinct) --"
+{
+    printf '     %-46s %s\n' "SiNiSistar2.app" "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
+    for f in "$APP"/Frameworks/*.framework/Info.plist; do
+        [ -f "$f" ] || continue
+        printf '     %-46s %s\n' "$(basename "$(dirname "$f")")" "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$f")"
+    done
+} | tee -a "$LOG"
+DUPES=$( { /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
+           for f in "$APP"/Frameworks/*.framework/Info.plist; do
+               [ -f "$f" ] && /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$f"
+           done; } | sort | uniq -d )
+if [ -n "$DUPES" ]; then
+    log "   FATAL: duplicate bundle identifier(s): $DUPES"
+    exit 1
+fi
+log "   all identifiers unique"
 log "   $APP"
 log "   total $(du -sh "$APP" | cut -f1)"
 log "   -- top level --"
