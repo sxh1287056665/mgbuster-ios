@@ -284,6 +284,20 @@ if [ "$pc" -ne 0 ]; then
     exit 1
 fi
 
+# The engine is the China edition and stamps itself 2022.3.62f2c1, while the
+# game's data comes from an international macOS build stamped 2022.3.62f2.
+# Unity refuses the data over that suffix. Shortening the engine's constant is
+# a two-byte edit; lengthening the data's would shift every object offset.
+log ""
+log "--- patch engine version constant ---"
+python3 "$ROOT/patch_engine_version.py" \
+    "$APP/Frameworks/UnityFramework.framework/UnityFramework" 2>&1 | tee -a "$LOG"
+pc=${PIPESTATUS[0]}
+if [ "$pc" -ne 0 ]; then
+    log "engine version patch failed (exit $pc)"
+    exit 1
+fi
+
 # dyld resolves @rpath/GameAssembly.framework/GameAssembly here
 mkdir -p "$APP/Frameworks"
 rm -rf "$APP/Frameworks/GameAssembly.framework" "$APP/Frameworks/GameAssembly.dylib"
