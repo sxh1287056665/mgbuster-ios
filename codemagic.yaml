@@ -50,17 +50,26 @@ workflows:
 
       - name: Build UnityFramework
         script: |
-          set -e
+          # pipefail is essential: without it a pipeline's status is the last
+          # command's (tail), so a failing build would report success.
+          set -euo pipefail
           cd "$CM_BUILD_DIR"
           chmod +x build_ios.sh
-          ./build_ios.sh 2>&1 | tail -120 || {
-            echo "===================== BUILD FAILED ====================="
-            echo "--- last 250 lines of build.log ---"
-            tail -250 out/build.log 2>/dev/null || true
-            echo "--- grep for linker errors ---"
-            grep -iE 'undefined symbol|duplicate symbol|error:|ld: ' out/build.log 2>/dev/null | head -80 || true
+          set +e
+          ./build_ios.sh 2>&1 | tail -150
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "===================== BUILD FAILED (rc=$rc) ====================="
+            echo "--- compile errors ---"
+            grep -E 'error:' out/build.log 2>/dev/null | head -40 || true
+            echo "--- linker errors ---"
+            grep -iE 'undefined symbol|duplicate symbol|ld: ' out/build.log 2>/dev/null | head -60 || true
+            echo "--- first failing command ---"
+            grep -E '\*\* BUILD FAILED|The following build commands failed' -A3 out/build.log 2>/dev/null | head -20 || true
             exit 1
-          }
+          fi
+          echo "build script reported success"
 
       - name: Report
         script: |
