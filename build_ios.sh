@@ -127,6 +127,30 @@ install_name_tool -id "@rpath/GameAssembly.framework/GameAssembly" "$GAFW/GameAs
     || { log "install_name_tool failed"; exit 1; }
 log "   new install name: $(otool -D "$GAFW/GameAssembly" | tail -n +2)"
 
+# The dylib was linked against macOS, whose system frameworks live behind a
+# Versions/ symlink tree. iOS has no such directory: dyld only knows the flat
+# path, so every Versions/ dependency fails with "no such file, not in dyld
+# cache" and the whole framework load aborts. The ABI is identical - only the
+# recorded path is wrong - so rewriting the three load commands is enough.
+log "   retargeting macOS framework paths to the iOS layout:"
+for pair in \
+    "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation|/System/Library/Frameworks/Foundation.framework/Foundation" \
+    "/System/Library/Frameworks/Security.framework/Versions/A/Security|/System/Library/Frameworks/Security.framework/Security" \
+    "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation|/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+do
+    old="${pair%%|*}"
+    new="${pair##*|}"
+    install_name_tool -change "$old" "$new" "$GAFW/GameAssembly" \
+        && log "     $old" && log "       -> $new"
+done
+
+if otool -L "$GAFW/GameAssembly" | grep -q 'Versions/'; then
+    log "   FATAL: macOS Versions/ paths still present:"
+    otool -L "$GAFW/GameAssembly" | grep 'Versions/' | sed 's/^/     /'
+    exit 1
+fi
+log "   all dependencies use the iOS flat layout"
+
 if [ -f "$ROOT/strip_signature.py" ]; then
     python3 "$ROOT/strip_signature.py" "$GAFW/GameAssembly" 2>&1 | sed 's/^/     /' | tee -a "$LOG"
 else
