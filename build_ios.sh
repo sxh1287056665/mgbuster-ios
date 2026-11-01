@@ -117,9 +117,10 @@ cp "$PAYLOAD/Frameworks/GameAssembly.dylib" "$GAFW/GameAssembly"
 chmod 755 "$GAFW/GameAssembly"
 
 # The macOS build's signature is invalidated the moment the install name changes.
-# Strip it rather than leave a stale blob behind.
+# Do not strip it with --remove-signature: that drops the blob without shrinking
+# __LINKEDIT, leaving a file install_name_tool then refuses to touch. Changing
+# the install name first, then re-signing in place, replaces the blob cleanly.
 log "   old install name: $(otool -D "$GAFW/GameAssembly" | tail -n +2)"
-codesign --remove-signature "$GAFW/GameAssembly" 2>/dev/null || true
 install_name_tool -id "@rpath/GameAssembly.framework/GameAssembly" "$GAFW/GameAssembly" \
     || { log "install_name_tool failed"; exit 1; }
 log "   new install name: $(otool -D "$GAFW/GameAssembly" | tail -n +2)"
@@ -153,9 +154,12 @@ PLIST
 
 # Ad-hoc signature so the framework is internally consistent even before the
 # consumer re-signs the app. codesign --deep replaces this with their identity.
-codesign --force --sign - --timestamp=none "$GAFW" 2>/dev/null \
-    && log "   ad-hoc signed GameAssembly.framework" \
-    || log "   WARNING: ad-hoc signing failed (consumer must sign nested code)"
+codesign --force --sign - --timestamp=none "$GAFW/GameAssembly" 2>&1 | sed 's/^/     /' | tee -a "$LOG"
+if codesign --verify --verbose=1 "$GAFW/GameAssembly" 2>&1 | sed 's/^/     /' | tee -a "$LOG"; then
+    log "   ad-hoc signature valid"
+else
+    log "   WARNING: ad-hoc signature did not verify"
+fi
 
 log ""
 log "== 5. build =="
