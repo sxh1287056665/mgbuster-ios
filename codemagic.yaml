@@ -16,7 +16,10 @@ workflows:
           curl -L --retry 3 --retry-delay 5 -o payload.zip "$PAYLOAD_URL"
           ls -la payload.zip
           echo "--- unpacking ---"
-          unzip -q payload.zip -d .
+          # -o: overwrite without prompting. CI has no stdin, so any prompt
+          #     (e.g. a file already present from the repo checkout) would be
+          #     answered "none" and unzip would exit 1.
+          unzip -q -o payload.zip -d .
           echo "--- tree ---"
           ls -la
           du -sh Libraries Frameworks 2>/dev/null || true
