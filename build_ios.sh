@@ -76,15 +76,23 @@ log "   Unity_il2cppNoExceptions defined by: Libraries/Il2CppOptions.cpp (functi
 log ""
 log "== 3. stub archive for the GameAssembly slot =="
 # The UnityFramework target links libGameAssembly.a out of BUILT_PRODUCTS_DIR.
-# Unity fills that with generated C++; we compile none, so an empty archive
-# keeps the link line satisfied.
+# Unity fills that with generated C++; we compile none. The archive still has to
+# be a well-formed one - ld rejects a zero-byte file - so it carries a single
+# placeholder object.
 STUB="$OUT/stub"
 mkdir -p "$STUB" "$SYMROOT/Release-iphoneos"
-xcrun --sdk iphoneos libtool -static -o "$STUB/libGameAssembly.a" 2>/dev/null \
-    || xcrun --sdk iphoneos ar -q "$STUB/libGameAssembly.a" 2>/dev/null \
-    || : > "$STUB/libGameAssembly.a"
+cat > "$STUB/placeholder.c" <<'EOF'
+/* Stands in for the IL2CPP-generated translation units Unity would place in
+   libGameAssembly.a. The real game code is linked from GameAssembly.dylib. */
+int __unity_ios_link_placeholder = 0;
+EOF
+xcrun --sdk iphoneos clang -arch arm64 -mios-version-min=11.0 -O2 \
+    -c "$STUB/placeholder.c" -o "$STUB/placeholder.o" \
+    || { log "placeholder compile failed"; exit 1; }
+xcrun --sdk iphoneos libtool -static -o "$STUB/libGameAssembly.a" "$STUB/placeholder.o" \
+    || { log "placeholder archive failed"; exit 1; }
 cp "$STUB/libGameAssembly.a" "$SYMROOT/Release-iphoneos/libGameAssembly.a"
-log "   placed $SYMROOT/Release-iphoneos/libGameAssembly.a"
+log "   placed $SYMROOT/Release-iphoneos/libGameAssembly.a ($(du -h "$STUB/libGameAssembly.a" | cut -f1))"
 
 log ""
 log "== 4. linking =="
