@@ -253,6 +253,7 @@ xcodebuild \
     PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
     GCC_PREPROCESSOR_DEFINITIONS="$DEFINES" \
     OTHER_LDFLAGS_FRAMEWORK="$LDFLAGS" \
+    OTHER_LDFLAGS="-Wl,-no_fixup_chains" \
     2>&1 | tee -a "$LOG"
 rc=${PIPESTATUS[0]}
 set +x
@@ -268,6 +269,21 @@ log "================ BUILD OK ================"
 
 APP="$SYMROOT/Release-iphoneos/$APP_NAME.app"
 [ -d "$APP" ] || { log "app not found at $APP"; ls -la "$SYMROOT/Release-iphoneos"; exit 1; }
+
+# The engine's manager-load failure path dereferences the null it just tested,
+# so the "Failed to load %s (internal index #%i)" message never prints and the
+# crash log cannot say which manager was missing. Neutralise that one load so
+# the message (and its index) survives. Static edit: runtime __TEXT writes are
+# blocked by code signing on iOS.
+log ""
+log "--- patch null manager dereference ---"
+python3 "$ROOT/patch_nullmanager.py" \
+    "$APP/Frameworks/UnityFramework.framework/UnityFramework" 2>&1 | tee -a "$LOG"
+pc=${PIPESTATUS[0]}
+if [ "$pc" -ne 0 ]; then
+    log "patch step failed (exit $pc)"
+    exit 1
+fi
 
 # dyld resolves @rpath/GameAssembly.framework/GameAssembly here
 mkdir -p "$APP/Frameworks"
