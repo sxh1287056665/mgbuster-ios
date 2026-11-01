@@ -117,13 +117,28 @@ cp "$PAYLOAD/Frameworks/GameAssembly.dylib" "$GAFW/GameAssembly"
 chmod 755 "$GAFW/GameAssembly"
 
 # The macOS build's signature is invalidated the moment the install name changes.
-# Do not strip it with --remove-signature: that drops the blob without shrinking
-# __LINKEDIT, leaving a file install_name_tool then refuses to touch. Changing
-# the install name first, then re-signing in place, replaces the blob cleanly.
+# Order matters:
+#   1. install_name_tool must run while the signature is still at EOF - it refuses
+#      a file whose LC_CODE_SIGNATURE is present but not at the end
+#   2. only then cut the signature out (strip_signature.py also shrinks
+#      __LINKEDIT, which codesign --remove-signature fails to do)
 log "   old install name: $(otool -D "$GAFW/GameAssembly" | tail -n +2)"
 install_name_tool -id "@rpath/GameAssembly.framework/GameAssembly" "$GAFW/GameAssembly" \
     || { log "install_name_tool failed"; exit 1; }
 log "   new install name: $(otool -D "$GAFW/GameAssembly" | tail -n +2)"
+
+if [ -f "$ROOT/strip_signature.py" ]; then
+    python3 "$ROOT/strip_signature.py" "$GAFW/GameAssembly" 2>&1 | sed 's/^/     /' | tee -a "$LOG"
+else
+    log "   WARNING: strip_signature.py missing; signature left in place"
+fi
+
+# Deliberately shipped UNSIGNED. An ad-hoc signature here would drop a
+# _CodeSignature/CodeResources seal computed over the ad-hoc identity; a signing
+# tool that re-signs only the binary and leaves that seal behind produces a
+# bundle whose seal does not match, and iOS rejects the install.
+rm -rf "$GAFW/_CodeSignature"
+log "   shipped unsigned (no _CodeSignature) - consumer signs the bundle"
 
 cat > "$GAFW/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
