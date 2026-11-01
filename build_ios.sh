@@ -11,12 +11,17 @@
 # libil2cpp*.a is deliberately NOT linked: GameAssembly.dylib already exports
 # the IL2CPP VM, and linking both would duplicate every il2cpp_* definition.
 #
+# Two build-time gaps in the Trampoline template are filled here:
+#   UNITY_VERSION_VER/MAJ/MIN   Unity writes these into the pbxproj at build
+#                               time; the template ships without them
+#   Classes/Native/pch-cpp.hpp  IL2CPP-generated header, stubbed (we compile no
+#                               generated C++)
+#
 # Runs on macOS with Xcode. No Unity install, no Unity license.
 # =============================================================================
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-# Payload may sit beside the script (CI: unzipped flat) or in ./payload (local).
 if [ -d "$ROOT/payload/Unity-iPhone.xcodeproj" ]; then
     PAYLOAD="$ROOT/payload"
 else
@@ -31,9 +36,14 @@ mkdir -p "$OUT" "$SYMROOT"
 
 log() { echo "$@" | tee -a "$LOG"; }
 
+# Unity version this payload was cut from.
+UNITY_VER=2022
+UNITY_MAJ=3
+UNITY_MIN=62
+
 log "=============================================================="
 log " payload : $PAYLOAD"
-log " out     : $OUT"
+log " unity   : ${UNITY_VER}.${UNITY_MAJ}.${UNITY_MIN}"
 log "=============================================================="
 
 log ""
@@ -44,7 +54,8 @@ for f in \
     "$PAYLOAD/Libraries/libiPhone-lib.a" \
     "$PAYLOAD/Libraries/baselib.a" \
     "$PAYLOAD/Frameworks/GameAssembly.dylib" \
-    "$PAYLOAD/Classes/UnityNoExceptionsStub.c"
+    "$PAYLOAD/Classes/UnityNoExceptionsStub.c" \
+    "$PAYLOAD/Classes/Native/pch-cpp.hpp"
 do
     if [ -e "$f" ]; then
         log "   ok   $(printf '%-42s' "${f#$PAYLOAD/}") $(du -h "$f" | cut -f1)"
@@ -59,14 +70,9 @@ log ""
 log "== 2. GameAssembly.dylib sanity =="
 otool -hv "$PAYLOAD/Frameworks/GameAssembly.dylib" | sed -n '2,3p' | tee -a "$LOG"
 log "   exported il2cpp_ symbols: $(nm -gU "$PAYLOAD/Frameworks/GameAssembly.dylib" 2>/dev/null | grep -c '_il2cpp_')"
-log "   linked dylibs:"
-otool -L "$PAYLOAD/Frameworks/GameAssembly.dylib" | tail -n +2 | sed 's/^/     /' | tee -a "$LOG"
 
 log ""
 log "== 3. stub archive for the GameAssembly slot =="
-# The Xcode project's UnityFramework target links libGameAssembly.a out of
-# BUILT_PRODUCTS_DIR. Unity would fill that with generated C++; we only need the
-# single global the engine references, so we place a minimal archive there.
 STUB="$OUT/stub"
 mkdir -p "$STUB"
 xcrun --sdk iphoneos clang -arch arm64 -mios-version-min=11.0 -O2 \
@@ -84,9 +90,6 @@ cd "$PAYLOAD"
 
 DYLIB="$PAYLOAD/Frameworks/GameAssembly.dylib"
 ENGINE="$PAYLOAD/Libraries/libiPhone-lib.a"
-
-# -force_load the engine: it is an archive of 1638 objects and the linker would
-# otherwise drop everything not directly referenced from our own code.
 LDFLAGS="-ObjC -Wl,-force_load,$ENGINE $DYLIB -Wl,-search_paths_first"
 
 set -x
@@ -103,6 +106,9 @@ xcodebuild \
     SYMROOT="$SYMROOT" \
     OBJROOT="$OUT/obj" \
     VALIDATE_PRODUCT=NO \
+    UNITY_VERSION_VER="$UNITY_VER" \
+    UNITY_VERSION_MAJ="$UNITY_MAJ" \
+    UNITY_VERSION_MIN="$UNITY_MIN" \
     OTHER_LDFLAGS="$LDFLAGS" \
     2>&1 | tee -a "$LOG"
 rc=${PIPESTATUS[0]}
@@ -110,13 +116,15 @@ set +x
 
 log ""
 if [ "$rc" -ne 0 ]; then
-    log "================ LINK FAILED (exit $rc) ================"
-    log "--- undefined / duplicate symbols ---"
-    grep -iE 'undefined symbol|duplicate symbol|ld: |clang: error' "$LOG" | head -80
+    log "================ BUILD FAILED (exit $rc) ================"
+    log "--- compile errors ---"
+    grep -E 'error:' "$LOG" | head -40
+    log "--- linker errors ---"
+    grep -iE 'undefined symbol|duplicate symbol|ld: ' "$LOG" | head -60
     exit "$rc"
 fi
 
-log "================ LINK OK ================"
+log "================ BUILD OK ================"
 find "$OUT" -name 'UnityFramework' -type f 2>/dev/null | while read -r f; do
     log "  $f  $(du -h "$f" | cut -f1)"
     lipo -info "$f" | sed 's/^/    /' | tee -a "$LOG"
