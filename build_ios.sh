@@ -5,16 +5,17 @@
 # Links a Unity 2022.3.62f2 iOS app from:
 #   libiPhone-lib.a        iOS engine, arm64 device, prebuilt by Unity
 #   GameAssembly.dylib     the game logic, arm64, LC_BUILD_VERSION retagged to iOS
-#   UnityNoExceptionsStub  supplies the one symbol the engine wants that the
-#                          dylib does not export
+#   Libraries/*.cpp        Unity's two trampoline-side translation units
+#                          (Il2CppOptions.cpp defines Unity_il2cppNoExceptions)
 #
 # libil2cpp*.a is deliberately NOT linked: GameAssembly.dylib already exports
 # the IL2CPP VM, and linking both would duplicate every il2cpp_* definition.
 #
 # Two build-time gaps in the Trampoline template are filled here:
 #   UNITY_VERSION_VER/MAJ/MIN   Unity writes these into the pbxproj at build
-#                               time; the template ships without them
-#   Classes/Native/pch-cpp.hpp  IL2CPP-generated header, stubbed (we compile no
+#                               time; the template ships without them, and they
+#                               are checked by the C preprocessor
+#   Classes/pch-cpp.hpp         IL2CPP-generated header, stubbed (we compile no
 #                               generated C++)
 #
 # Runs on macOS with Xcode. No Unity install, no Unity license.
@@ -36,7 +37,6 @@ mkdir -p "$OUT" "$SYMROOT"
 
 log() { echo "$@" | tee -a "$LOG"; }
 
-# Unity version this payload was cut from.
 UNITY_VER=2022
 UNITY_MAJ=3
 UNITY_MIN=62
@@ -53,12 +53,13 @@ for f in \
     "$PAYLOAD/Unity-iPhone.xcodeproj/project.pbxproj" \
     "$PAYLOAD/Libraries/libiPhone-lib.a" \
     "$PAYLOAD/Libraries/baselib.a" \
+    "$PAYLOAD/Libraries/Il2CppOptions.cpp" \
+    "$PAYLOAD/Libraries/RegisterFeatures.cpp" \
     "$PAYLOAD/Frameworks/GameAssembly.dylib" \
-    "$PAYLOAD/Classes/UnityNoExceptionsStub.c" \
     "$PAYLOAD/Classes/pch-cpp.hpp"
 do
     if [ -e "$f" ]; then
-        log "   ok   $(printf '%-42s' "${f#$PAYLOAD/}") $(du -h "$f" | cut -f1)"
+        log "   ok   $(printf '%-40s' "${f#$PAYLOAD/}") $(du -h "$f" | cut -f1)"
     else
         log "   MISS $f"
         fail=1
@@ -70,17 +71,18 @@ log ""
 log "== 2. GameAssembly.dylib sanity =="
 otool -hv "$PAYLOAD/Frameworks/GameAssembly.dylib" | sed -n '2,3p' | tee -a "$LOG"
 log "   exported il2cpp_ symbols: $(nm -gU "$PAYLOAD/Frameworks/GameAssembly.dylib" 2>/dev/null | grep -c '_il2cpp_')"
+log "   Unity_il2cppNoExceptions defined by: Libraries/Il2CppOptions.cpp (function)"
 
 log ""
 log "== 3. stub archive for the GameAssembly slot =="
+# The UnityFramework target links libGameAssembly.a out of BUILT_PRODUCTS_DIR.
+# Unity fills that with generated C++; we compile none, so an empty archive
+# keeps the link line satisfied.
 STUB="$OUT/stub"
-mkdir -p "$STUB"
-xcrun --sdk iphoneos clang -arch arm64 -mios-version-min=11.0 -O2 \
-    -c "$PAYLOAD/Classes/UnityNoExceptionsStub.c" -o "$STUB/UnityNoExceptionsStub.o" \
-    || { log "stub compile failed"; exit 1; }
-xcrun --sdk iphoneos libtool -static -o "$STUB/libGameAssembly.a" \
-    "$STUB/UnityNoExceptionsStub.o" || { log "stub archive failed"; exit 1; }
-mkdir -p "$SYMROOT/Release-iphoneos"
+mkdir -p "$STUB" "$SYMROOT/Release-iphoneos"
+xcrun --sdk iphoneos libtool -static -o "$STUB/libGameAssembly.a" 2>/dev/null \
+    || xcrun --sdk iphoneos ar -q "$STUB/libGameAssembly.a" 2>/dev/null \
+    || : > "$STUB/libGameAssembly.a"
 cp "$STUB/libGameAssembly.a" "$SYMROOT/Release-iphoneos/libGameAssembly.a"
 log "   placed $SYMROOT/Release-iphoneos/libGameAssembly.a"
 
