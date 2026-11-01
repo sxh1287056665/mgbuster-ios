@@ -253,7 +253,6 @@ xcodebuild \
     PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
     GCC_PREPROCESSOR_DEFINITIONS="$DEFINES" \
     OTHER_LDFLAGS_FRAMEWORK="$LDFLAGS" \
-    OTHER_LDFLAGS="-Wl,-no_fixup_chains" \
     2>&1 | tee -a "$LOG"
 rc=${PIPESTATUS[0]}
 set +x
