@@ -307,6 +307,33 @@ static int field_off_any(Il2CppClass *klass, const char *const *names, int n)
 // il2cpp reports struct field offsets including a 16-byte object header.
 static int inner(int reported) { return reported >= 16 ? reported - 16 : -1; }
 
+// A bare "AddDevice threw" tells us nothing actionable, and guessing at the
+// cause costs a 2.19 GB install cycle. Pull the real message out.
+// An Il2CppString is a 16-byte header, an int32 length, then UTF-16 data, so
+// this needs no extra exported symbol.
+static void exc_message(Il2CppException *exc, char *out, size_t n)
+{
+    out[0] = 0;
+    if (!exc) return;
+    // The object header starts with the class pointer; no API needed.
+    Il2CppClass *k = *(Il2CppClass **)exc;
+    while (k && strcmp(f_class_get_name(k), "Exception") != 0)
+        k = f_class_get_parent(k);
+    if (!k) { snprintf(out, n, "<not an Exception>"); return; }
+    MethodInfo *m = f_class_get_method_from_name(k, "get_Message", 0);
+    if (!m) { snprintf(out, n, "<no get_Message>"); return; }
+    Il2CppException *inner_exc = NULL;
+    Il2CppObject *s = f_runtime_invoke(m, exc, NULL, &inner_exc);
+    if (inner_exc || !s) { snprintf(out, n, "<get_Message failed>"); return; }
+    int32_t len = *(int32_t *)((char *)s + 16);
+    const uint16_t *ch = (const uint16_t *)((char *)s + 20);
+    if (len < 0) len = 0;
+    size_t j = 0;
+    for (int32_t i = 0; i < len && j + 1 < n; i++)
+        out[j++] = (ch[i] < 0x80) ? (char)ch[i] : '?';
+    out[j] = 0;
+}
+
 // Search a class and its ancestors for a method. ReadValue lives on the
 // generic base InputControl<TValue>, not on StickControl itself, so a plain
 // lookup on the concrete class comes back empty.
@@ -334,6 +361,14 @@ static Il2CppClass *g_cInputEvent = NULL;
 static Il2CppClass *g_cStateEvent = NULL;
 static Il2CppClass *g_cStick = NULL;
 static Il2CppClass *g_cGamepadState = NULL;
+
+static MethodInfo *g_addMethod = NULL;
+static Il2CppString *g_sLayout = NULL;
+static Il2CppString *g_sName = NULL;
+
+static int stage2(void);
+static void gbpad_readback(void);
+static void gbpad_create_device(int attempt);
 
 static int g_stateBlockOff = -1;   // InputDevice.m_StateBlock (absolute in object)
 static int g_deviceIdOff = -1;     // InputDevice.m_DeviceId (absolute in object)
@@ -473,36 +508,16 @@ static int stage1(void)
         fprintf(stderr, TAG "no usable AddDevice overload\n");
         return -1;
     }
+    g_addMethod = add;
+    g_sLayout = f_string_new("Gamepad");
+    g_sName = f_string_new("GBPad");
 
-    Il2CppString *sLayout = f_string_new("Gamepad");
-    Il2CppString *sName = f_string_new("GBPad");
-    Il2CppException *exc = NULL;
-    Il2CppObject *dev = NULL;
-    if (f_method_get_param_count(add) >= 3) {
-        void *args[3] = { sLayout, sName, NULL };
-        dev = f_runtime_invoke(add, NULL, args, &exc);
-    } else {
-        void *args[1] = { sLayout };
-        dev = f_runtime_invoke(add, NULL, args, &exc);
-    }
-    if (exc) {
-        fprintf(stderr, TAG "AddDevice threw (exception %p)\n", (void *)exc);
-        return -1;
-    }
-    if (!dev) {
-        fprintf(stderr, TAG "AddDevice returned null\n");
-        return -1;
-    }
-    g_device = dev;
-    fprintf(stderr, TAG "GAMEPAD CREATED at %p\n", (void *)dev);
-
-    MethodInfo *getCurrent = f_class_get_method_from_name(g_cGamepad, "get_current", 0);
-    if (getCurrent) {
-        Il2CppException *e2 = NULL;
-        Il2CppObject *cur = f_runtime_invoke(getCurrent, NULL, NULL, &e2);
-        fprintf(stderr, TAG "Gamepad.current -> %p%s\n", (void *)cur,
-                (cur == dev) ? "  (matches the new device)" : "");
-    }
+    // InputSystem.AddDevice mutates the device list owned by a manager created
+    // on the main thread. Calling it from here threw on device, so hand the
+    // device work over rather than poking it cross-thread.
+    fprintf(stderr, TAG "AddDevice/%u resolved, handing off to main thread\n",
+            f_method_get_param_count(add));
+    dispatch_async(dispatch_get_main_queue(), ^{ gbpad_create_device(0); });
     return 1;
 }
 
@@ -592,12 +607,18 @@ static int stage2(void)
             evType, devId, total, g_payloadOff + g_leftStickOff, state[0], state[1]);
     free(ev);
 
-    // Let the player loop consume the event. Calling InputSystem.Update() from
-    // this thread would race the front/back state-buffer swap.
-    usleep(150 * 1000);
+    // The player loop consumes queued events on its own InputSystem.Update().
+    // Sleeping here would work but this now runs on the main thread, so it
+    // would freeze the game for the duration. Come back later instead.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{ gbpad_readback(); });
+    return 0;
+}
 
-    // Read back through the managed API - the proof the chain works, with no
-    // controller involved and no gameplay side effects beyond the stick value.
+// Read back through the managed API - the proof the chain works, with no
+// controller involved and no gameplay side effects beyond the stick value.
+static void gbpad_readback(void)
+{
     MethodInfo *getCurrent = f_class_get_method_from_name(g_cGamepad, "get_current", 0);
     MethodInfo *getStick = f_class_get_method_from_name(g_cGamepad, "get_leftStick", 0);
     MethodInfo *readObj = g_cStick ? find_method_up(g_cStick, "ReadValueAsObject", 0, 12) : NULL;
@@ -605,32 +626,84 @@ static int stage2(void)
     if (!getCurrent || !getStick || !readObj) {
         fprintf(stderr, TAG "readback unavailable (get_current=%p get_leftStick=%p ReadValueAsObject=%p)\n",
                 (void *)getCurrent, (void *)getStick, (void *)readObj);
-        return 0;
+        return;
     }
 
     Il2CppException *e1 = NULL;
     Il2CppObject *cur = f_runtime_invoke(getCurrent, NULL, NULL, &e1);
     if (!cur || e1) {
         fprintf(stderr, TAG "readback: Gamepad.current null\n");
-        return 0;
+        return;
     }
     Il2CppException *e2 = NULL;
     Il2CppObject *stick = f_runtime_invoke(getStick, cur, NULL, &e2);
     if (!stick || e2) {
         fprintf(stderr, TAG "readback: leftStick control null\n");
-        return 0;
+        return;
     }
     Il2CppException *e3 = NULL;
     Il2CppObject *boxed = f_runtime_invoke(readObj, stick, NULL, &e3);
     if (!boxed || e3) {
-        fprintf(stderr, TAG "readback: ReadValueAsObject failed\n");
-        return 0;
+        char msg[256];
+        exc_message(e3, msg, sizeof msg);
+        fprintf(stderr, TAG "readback: ReadValueAsObject failed: %s\n", msg);
+        return;
     }
     // Boxed Vector2: il2cpp object header (klass*, monitor) then the value.
     float *v = (float *)((unsigned char *)boxed + 2 * sizeof(void *));
     fprintf(stderr, TAG "READBACK leftStick = (%.3f, %.3f)%s\n", v[0], v[1],
             (v[0] > 0.5f) ? "   <== INJECTION WORKS" : "   <== did not take");
-    return 0;
+}
+
+// --- device creation, on the main thread -----------------------------------
+// InputSystem.AddDevice is not thread safe: it walks and mutates the device list
+// owned by a manager created on the main thread. Called from the worker it threw
+// on device, so everything that touches a device now runs on the main queue.
+//
+// Retries exist because the Input System manager is created by the player loop
+// initialiser, which may not have run yet at the moment startUnity: returns.
+static void gbpad_create_device(int attempt)
+{
+    if (g_device) return;
+    if (attempt >= 20) {
+        fprintf(stderr, TAG "AddDevice still failing after %d attempts, stopping\n", attempt);
+        return;
+    }
+
+    Il2CppException *exc = NULL;
+    Il2CppObject *dev = NULL;
+    if (f_method_get_param_count(g_addMethod) >= 3) {
+        void *args[3] = { g_sLayout, g_sName, NULL };
+        dev = f_runtime_invoke(g_addMethod, NULL, args, &exc);
+    } else {
+        void *args[1] = { g_sLayout };
+        dev = f_runtime_invoke(g_addMethod, NULL, args, &exc);
+    }
+
+    if (exc || !dev) {
+        char msg[256];
+        exc_message(exc, msg, sizeof msg);
+        fprintf(stderr, TAG "AddDevice attempt %d failed: %s\n",
+                attempt + 1, exc ? msg : "returned null");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{ gbpad_create_device(attempt + 1); });
+        return;
+    }
+
+    g_device = dev;
+    fprintf(stderr, TAG "GAMEPAD CREATED at %p (attempt %d)\n", (void *)dev, attempt + 1);
+
+    MethodInfo *getCurrent = f_class_get_method_from_name(g_cGamepad, "get_current", 0);
+    if (getCurrent) {
+        Il2CppException *e2 = NULL;
+        Il2CppObject *cur = f_runtime_invoke(getCurrent, NULL, NULL, &e2);
+        fprintf(stderr, TAG "Gamepad.current -> %p%s\n", (void *)cur,
+                (cur == dev) ? "  (matches)" : "");
+    }
+
+    // Give the player loop a frame to register the device before feeding state.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{ stage2(); });
 }
 
 // --- bootstrap -------------------------------------------------------------
@@ -667,21 +740,18 @@ static void *worker(void *unused)
     }
     fprintf(stderr, TAG "IL2CPP API bound\n");
 
-    for (int i = 0; i < 40; i++) {
+    int resolved = 0;
+    for (int i = 0; i < 40 && !resolved; i++) {
         int r = stage1();
-        if (r == 1) break;
+        if (r == 1) { resolved = 1; break; }
         if (r < 0) { fprintf(stderr, TAG "stage 1 failed, stopping\n"); return NULL; }
         usleep(250 * 1000);
     }
-    if (!g_device) {
-        fprintf(stderr, TAG "no device after retries, stopping\n");
+    if (!resolved) {
+        fprintf(stderr, TAG "could not resolve InputSystem after retries\n");
         return NULL;
     }
-    fprintf(stderr, TAG "stage 1 complete\n");
-
-    usleep(1500 * 1000);   // let the scene finish loading before feeding state
-    stage2();
-    fprintf(stderr, TAG "stage 2 done\n");
+    fprintf(stderr, TAG "stage 1 complete, device creation queued on main thread\n");
     return NULL;
 }
 
