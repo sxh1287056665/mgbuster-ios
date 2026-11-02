@@ -33,11 +33,14 @@
 //   il2cpp_init() runs, il2cpp_domain_get() does not return NULL, it returns
 //   uninitialised memory, and il2cpp_thread_attach() dereferences it.
 //
-//   The runtime is therefore never touched until il2cpp_init() has actually
-//   returned. We learn that by interposing il2cpp_init: UnityFramework imports
-//   it as an undefined symbol, so dyld redirects the engine's call through us.
-//   A long timeout remains as a backstop in case interposing ever stops
-//   matching, because by then the runtime is certainly up anyway.
+//   The second version tried to detect readiness by interposing il2cpp_init.
+//   On device the hook never fired even though managed code was running within
+//   0.5 s, so the replacee slots are most likely never bound. The worker now
+//   gates on a 10 s elapsed-time window instead, logging progress every 2 s.
+//   The interpose is retained only as an accelerator.
+//
+//   Consequence for testing: the probe does not run until ~10 s after launch.
+//   A capture taken before that shows only the "loaded" line.
 //
 // NO HARDCODED STRUCT LAYOUT
 //   Every offset below is resolved through il2cpp_field_get_offset at runtime.
@@ -147,21 +150,45 @@ static int bind_api(void)
 #undef BIND
 
 // --- il2cpp_init interposition ---------------------------------------------
-// UnityFramework imports il2cpp_init as an undefined symbol, so dyld routes the
-// engine's call here. Waiting for this is the only reliable "the runtime is
-// usable" signal; see the timing note at the top of the file.
+// Opportunistic only. On device this hook never fired: the log shows managed
+// code running by 0.5 s while the hook stayed silent, so the replacee slots are
+// most likely never bound and dyld skips the entry. The worker therefore gates
+// on elapsed time instead, and this is kept purely as an accelerator in case a
+// future build resolves it.
+//
+// The original is resolved through an explicit GameAssembly handle rather than
+// RTLD_NEXT. Getting that wrong is not cosmetic: returning early without
+// calling through would skip il2cpp_init entirely and brick startup.
 
 extern "C" int il2cpp_init(const char *domain_name);
 extern "C" int il2cpp_init_utf16(const uint16_t *domain_name);
 
 static int (*orig_il2cpp_init)(const char *);
 static int (*orig_il2cpp_init_utf16)(const uint16_t *);
+static void *g_gameassembly = NULL;
+
+static void *ga_symbol(const char *name)
+{
+    if (!g_gameassembly)
+        g_gameassembly = dlopen("@rpath/GameAssembly.framework/GameAssembly",
+                                RTLD_NOW | RTLD_GLOBAL);
+    void *p = g_gameassembly ? dlsym(g_gameassembly, name) : NULL;
+    if (!p) p = dlsym(RTLD_NEXT, name);
+    if (!p) p = dlsym(RTLD_DEFAULT, name);
+    return p;
+}
 
 static int hook_il2cpp_init(const char *domain_name)
 {
     if (!orig_il2cpp_init)
-        orig_il2cpp_init = (int (*)(const char *))dlsym(RTLD_NEXT, "il2cpp_init");
-    int rc = orig_il2cpp_init ? orig_il2cpp_init(domain_name) : -1;
+        orig_il2cpp_init = (int (*)(const char *))ga_symbol("il2cpp_init");
+    if (!orig_il2cpp_init) {
+        // Never swallow the call: letting the engine continue without an
+        // initialised runtime would fail far from here and look unrelated.
+        fprintf(stderr, TAG "FATAL cannot resolve real il2cpp_init\n");
+        return -1;
+    }
+    int rc = orig_il2cpp_init(domain_name);
     fprintf(stderr, TAG "il2cpp_init returned %d - runtime usable\n", rc);
     g_il2cpp_ready = 1;
     return rc;
@@ -170,8 +197,12 @@ static int hook_il2cpp_init(const char *domain_name)
 static int hook_il2cpp_init_utf16(const uint16_t *domain_name)
 {
     if (!orig_il2cpp_init_utf16)
-        orig_il2cpp_init_utf16 = (int (*)(const uint16_t *))dlsym(RTLD_NEXT, "il2cpp_init_utf16");
-    int rc = orig_il2cpp_init_utf16 ? orig_il2cpp_init_utf16(domain_name) : -1;
+        orig_il2cpp_init_utf16 = (int (*)(const uint16_t *))ga_symbol("il2cpp_init_utf16");
+    if (!orig_il2cpp_init_utf16) {
+        fprintf(stderr, TAG "FATAL cannot resolve real il2cpp_init_utf16\n");
+        return -1;
+    }
+    int rc = orig_il2cpp_init_utf16(domain_name);
     fprintf(stderr, TAG "il2cpp_init_utf16 returned %d - runtime usable\n", rc);
     g_il2cpp_ready = 1;
     return rc;
@@ -546,14 +577,26 @@ static void *worker(void *unused)
 {
     (void)unused;
 
-    // Never touch the runtime before il2cpp_init has returned. 25 s is a
-    // backstop only; interposing should always fire first.
-    int waited = 0;
-    while (!g_il2cpp_ready && waited < 250) { usleep(100 * 1000); waited++; }
-    if (!g_il2cpp_ready)
-        fprintf(stderr, TAG "interpose never fired after %d ms, probing anyway\n", waited * 100);
+    // Gate on elapsed time, not on the hook. Measured on device: managed code
+    // is already running 0.5 s after launch, so by 10 s il2cpp_init has long
+    // returned. Calling into the runtime any earlier is what killed the app in
+    // the first version - il2cpp_domain_get does not return NULL before init,
+    // it returns uninitialised memory.
+    //
+    // Progress is logged every 2 s so a short capture still proves the thread
+    // is alive and where it got to.
+    int tenths = 0;
+    const int GATE = 100;   // 10.0 s
+    while (!g_il2cpp_ready && tenths < GATE) {
+        usleep(100 * 1000);
+        tenths++;
+        if (tenths % 20 == 0)
+            fprintf(stderr, TAG "waiting for runtime: %d.%ds\n", tenths / 10, tenths % 10);
+    }
+    if (g_il2cpp_ready)
+        fprintf(stderr, TAG "hook fired at %d.%ds\n", tenths / 10, tenths % 10);
     else
-        fprintf(stderr, TAG "runtime ready after ~%d ms\n", waited * 100);
+        fprintf(stderr, TAG "hook silent, passing the %d s time gate\n", GATE / 10);
 
     usleep(500 * 1000);   // let the domain finish coming up
 
