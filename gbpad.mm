@@ -373,7 +373,16 @@ static MethodInfo *g_readValueAsObject = NULL;
 static void *g_evBuffer = NULL;
 static uint32_t g_evBufferSize = 0;
 static MethodInfo *g_queueMethod = NULL;
-static int g_injectTicks = 0;
+
+// Pointers into g_evBuffer, so the ticker can rewrite just the fields it cares
+// about instead of rebuilding the whole event.
+static float *g_stickPtr = NULL;
+static uint32_t *g_buttonsPtr = NULL;
+static int g_buttonsOff = 0;
+
+// The injected sequence walks through these phases. See gbpad_inject_tick.
+static int g_phase = 0;
+static int g_tick = 0;
 
 static MethodInfo *g_addMethod = NULL;
 static Il2CppString *g_sLayout = NULL;
@@ -491,6 +500,11 @@ static int stage1(void)
     int fStick = field_off_any(g_cGamepadState, stickNames, 1);
     g_leftStickOff = inner(fStick);
     if (g_leftStickOff < 0) g_leftStickOff = 4;
+
+    // buttons is the first field of GamepadState; resolve it rather than assume.
+    static const char *const btnNames[] = {"buttons"};
+    g_buttonsOff = inner(field_off_any(g_cGamepadState, btnNames, 1));
+    if (g_buttonsOff < 0) g_buttonsOff = 0;
     g_gamepadStateSize = f_class_value_size(g_cGamepadState, &align);
     if (g_gamepadStateSize <= 0 || g_gamepadStateSize > 128) g_gamepadStateSize = 28;
 
@@ -616,7 +630,6 @@ static int stage2(void)
     float *state = (float *)(ev + g_payloadOff + g_leftStickOff);
     state[0] = 0.60f;
     state[1] = 0.00f;
-
     MethodInfo *queue = f_class_get_method_from_name(g_cSys, "QueueEvent", 1);
     if (!queue) {
         fprintf(stderr, TAG "InputSystem.QueueEvent/1 not found\n");
@@ -645,7 +658,11 @@ static int stage2(void)
     // stick would fall back to zero once the single event ages out.
     g_evBuffer = ev;
     g_evBufferSize = total;
-    g_injectTicks = 15;   // 15 x 200 ms = 3 s of held deflection
+    g_stickPtr = state;
+    g_buttonsPtr = (uint32_t *)(ev + g_payloadOff + g_buttonsOff);
+    *g_buttonsPtr = 0u;
+    g_phase = 0;
+    g_tick = 0;
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{ gbpad_readback(); });
@@ -654,16 +671,56 @@ static int stage2(void)
     return 0;
 }
 
-// Hold the deflection for a few seconds so the effect is visible in-game, then
-// stop. This doubles as the visual confirmation: if the character walks, the
-// whole chain works.
+// Walk a short scripted sequence so one install answers three questions at
+// once: does an axis reach the game, do buttons reach the game, and does the
+// menu respond. The game binds <Gamepad>/buttonSouth and <Keyboard>/x to jump
+// and uses the same action for menu confirm.
+//
+// The state has to be re-asserted every tick: each InputSystem update treats
+// the last queued state as current, so a single event would age out.
 static void gbpad_inject_tick(void)
 {
-    if (!g_device || !g_evBuffer || !g_queueMethod || g_injectTicks <= 0) {
-        fprintf(stderr, TAG "injection stopped\n");
+    if (!g_device || !g_evBuffer || !g_queueMethod) return;
+
+    int stop = 0;
+
+    if (g_phase == 0) {
+        if (g_tick == 0)
+            fprintf(stderr, TAG "phase 1: holding leftStick (0.60, 0.00)\n");
+        g_tick++;
+        if (g_tick > 8) {
+            if (g_stickPtr) { g_stickPtr[0] = 0.0f; g_stickPtr[1] = 0.0f; }
+            g_phase = 1;
+            g_tick = 0;
+            fprintf(stderr, TAG "phase 2: pulsing buttonSouth\n");
+        }
+    } else if (g_phase == 1) {
+        g_tick++;
+        int down = (g_tick % 2) == 1;
+        if (g_buttonsPtr) *g_buttonsPtr = down ? 1u : 0u;   // GamepadButton.ButtonSouth
+        fprintf(stderr, TAG "  buttonSouth %s\n", down ? "down" : "up");
+        if (g_tick > 8) {
+            if (g_buttonsPtr) *g_buttonsPtr = 0u;
+            g_phase = 2;
+            g_tick = 0;
+            fprintf(stderr, TAG "phase 3: pulsing Start\n");
+        }
+    } else if (g_phase == 2) {
+        g_tick++;
+        int down = (g_tick % 2) == 1;
+        if (g_buttonsPtr) *g_buttonsPtr = down ? 4096u : 0u;  // GamepadButton.Start
+        fprintf(stderr, TAG "  Start %s\n", down ? "down" : "up");
+        if (g_tick > 4) stop = 1;
+    } else {
+        stop = 1;
+    }
+
+    if (stop) {
+        if (g_buttonsPtr) *g_buttonsPtr = 0u;
+        g_phase = 3;
+        fprintf(stderr, TAG "injection finished\n");
         return;
     }
-    g_injectTicks--;
 
     void *ptr = g_evBuffer;
     void *args[1] = { &ptr };
