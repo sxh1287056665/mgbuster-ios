@@ -46,6 +46,17 @@ workflows:
           find Data -type f | head -20
           echo "total: $(find Data -type f | wc -l | tr -d ' ') files, $(du -sh Data | cut -f1)"
 
+      - name: Patch platform check
+        script: |
+          set -e
+          cd "$CM_BUILD_DIR"
+          # The game data is built for StandaloneOSX, and SerializedFile::
+          # ReadMetadata hard-rejects anything that is not kBuildTargetiOS.
+          # NOP the two b.ne guards so the engine takes the "compatible" path.
+          # The script fails loudly if the member or the expected opcode is
+          # not where it is supposed to be, so no output check is needed here.
+          python3 patch_bundle_platform.py Libraries/libiPhone-lib.a --no-backup
+
       - name: Build app
         script: |
           # pipefail is essential: without it a pipeline's status is the last
