@@ -319,6 +319,25 @@ else
     log "engine already reports 2022.3.62f2 (international build), patch skipped"
 fi
 
+# startUnity: notifies the C# layer of the mute state through
+# UnityEngine.AudioSettings/Mobile::InvokeOnMuteStateChanged. That type is
+# mobile-only, so the macOS il2cpp build stripped it: the method lookup returns
+# null and the caller dereferences it without checking, killing the process
+# before the first scene. The notification has no return value, so turning the
+# function into a bare ret is enough.
+#
+# This has to run here, not in a post-build CI step: section 7 below zips the
+# .app into the ipa, and edits made after that never reach the artifact.
+log ""
+log "--- patch audio bootstrap ---"
+python3 "$ROOT/patch_audio_proxy.py" \
+    "$APP/Frameworks/UnityFramework.framework/UnityFramework" --no-backup 2>&1 | tee -a "$LOG"
+pc=${PIPESTATUS[0]}
+if [ "$pc" -ne 0 ]; then
+    log "audio bootstrap patch failed (exit $pc)"
+    exit 1
+fi
+
 # dyld resolves @rpath/GameAssembly.framework/GameAssembly here
 mkdir -p "$APP/Frameworks"
 rm -rf "$APP/Frameworks/GameAssembly.framework" "$APP/Frameworks/GameAssembly.dylib"
