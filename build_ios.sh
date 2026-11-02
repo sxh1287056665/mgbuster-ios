@@ -1,4 +1,4 @@
-#!/bin/bash
+﻿#!/bin/bash
 # =============================================================================
 # SiNiSistar2 -> iOS app package
 #
@@ -290,12 +290,19 @@ fi
 # a two-byte edit; lengthening the data's would shift every object offset.
 log ""
 log "--- patch engine version constant ---"
-python3 "$ROOT/patch_engine_version.py" \
-    "$APP/Frameworks/UnityFramework.framework/UnityFramework" 2>&1 | tee -a "$LOG"
-pc=${PIPESTATUS[0]}
-if [ "$pc" -ne 0 ]; then
-    log "engine version patch failed (exit $pc)"
-    exit 1
+# Only the China edition stamps itself 2022.3.62f2c1 and needs shortening.
+# The international engine already reads 2022.3.62f2, so a miss here is the
+# expected outcome, not a failure.
+if strings "$APP/Frameworks/UnityFramework.framework/UnityFramework" | grep -q '2022\.3\.62f2c1'; then
+    python3 "$ROOT/patch_engine_version.py" \
+        "$APP/Frameworks/UnityFramework.framework/UnityFramework" 2>&1 | tee -a "$LOG"
+    pc=${PIPESTATUS[0]}
+    if [ "$pc" -ne 0 ]; then
+        log "engine version patch failed (exit $pc)"
+        exit 1
+    fi
+else
+    log "engine already reports 2022.3.62f2 (international build), patch skipped"
 fi
 
 # dyld resolves @rpath/GameAssembly.framework/GameAssembly here
@@ -369,3 +376,4 @@ log "   framework  : $(nm -u "$APP/Frameworks/UnityFramework.framework/UnityFram
 log "   (these resolve at load time from GameAssembly.dylib)"
 
 exit 0
+
