@@ -28,19 +28,29 @@
 //   Input System to instantiate a Gamepad, and push state into it.
 //
 // TIMING - READ THIS BEFORE CHANGING ANYTHING
-//   The first version of this file polled il2cpp_domain_get() from a thread
-//   started in a constructor. That killed the app 24 ms after launch: before
-//   il2cpp_init() runs, il2cpp_domain_get() does not return NULL, it returns
-//   uninitialised memory, and il2cpp_thread_attach() dereferences it.
+//   Getting the "runtime is usable" moment wrong has already cost two device
+//   cycles, so the reasoning is recorded here.
 //
-//   The second version tried to detect readiness by interposing il2cpp_init.
-//   On device the hook never fired even though managed code was running within
-//   0.5 s, so the replacee slots are most likely never bound. The worker now
-//   gates on a 10 s elapsed-time window instead, logging progress every 2 s.
-//   The interpose is retained only as an accelerator.
+//   1. v1 polled il2cpp_domain_get() from a constructor thread. The app died at
+//      24 ms. Disassembly explains it: domain_get is not a plain accessor. When
+//      its cached pointer is NULL it mallocs a 0x38-byte placeholder domain and
+//      returns it, so it never returns NULL and tells you nothing. The crash was
+//      in il2cpp_thread_attach on that placeholder.
 //
-//   Consequence for testing: the probe does not run until ~10 s after launch.
-//   A capture taken before that shows only the "loaded" line.
+//   2. v2 interposed il2cpp_init through __DATA,__interpose. On device the hook
+//      never fired even though managed code was already running, so the
+//      replacee slots are never bound. Dropped - a dormant hook whose failure
+//      mode is "skip the real init" is a liability, not an asset.
+//
+//   3. v3 gated on a 10 s wall clock. Safe but wasteful: the game is playable at
+//      4 s, so the gamepad was dead for the first 10 s of every launch.
+//
+//   Now: swizzle -[UnityAppController startUnity:] and set the flag after it
+//   returns. Managed code provably runs inside startUnity (the v30 audio crash
+//   was inside it), so the runtime is initialised by then. Lands at ~0.5 s.
+//
+//   Neither il2cpp_thread_attach nor il2cpp_domain_get_assemblies can be probed
+//   before init - both dereference state that is not populated yet.
 //
 // NO HARDCODED STRUCT LAYOUT
 //   Every offset below is resolved through il2cpp_field_get_offset at runtime.
@@ -65,6 +75,8 @@
 // =============================================================================
 
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
+#import <objc/runtime.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -110,7 +122,7 @@ static const char *(*f_class_get_name)(Il2CppClass *);
 static const char *(*f_class_get_namespace)(Il2CppClass *);
 static Il2CppObject *(*f_thread_attach)(Il2CppDomain *);
 
-// Set only after the real il2cpp_init() has returned.
+// Set from the startUnity: hook once it has returned.
 static volatile int g_il2cpp_ready = 0;
 
 #define BIND(sym)                                                     \
@@ -149,72 +161,67 @@ static int bind_api(void)
 }
 #undef BIND
 
-// --- il2cpp_init interposition ---------------------------------------------
-// Opportunistic only. On device this hook never fired: the log shows managed
-// code running by 0.5 s while the hook stayed silent, so the replacee slots are
-// most likely never bound and dyld skips the entry. The worker therefore gates
-// on elapsed time instead, and this is kept purely as an accelerator in case a
-// future build resolves it.
+// --- readiness: hook -[UnityAppController startUnity:] ----------------------
+// Earlier attempts to detect "the runtime is usable" both failed on device:
 //
-// The original is resolved through an explicit GameAssembly handle rather than
-// RTLD_NEXT. Getting that wrong is not cosmetic: returning early without
-// calling through would skip il2cpp_init entirely and brick startup.
+//   1. Polling il2cpp_domain_get() crashed the app at 24 ms. Disassembly shows
+//      why: it is NOT a plain accessor. If its cached pointer is NULL it
+//      mallocs a 0x38-byte placeholder domain and returns that, so the return
+//      value is never NULL and says nothing about readiness.
+//      (GameAssembly vm 0x3f0aa4: ldr x0,[x20,#0x1f0]; cbz -> alloc; ret)
+//
+//   2. Interposing il2cpp_init never fired, even though managed code was
+//      already running. The replacee slots are evidently never bound.
+//
+// il2cpp_thread_attach and il2cpp_domain_get_assemblies are both unsafe before
+// init - the former dereferences a global that is not populated yet, the latter
+// dereferences whatever the domain accessor returns. Neither can be probed.
+//
+// So we key off something we can actually observe. -[UnityAppController
+// startUnity:] calls managed code before it returns (the v30 crash happened
+// inside it, in AudioSettings/Mobile::InvokeOnMuteStateChanged), so by the time
+// it returns il2cpp is definitely initialised. Swizzling an ObjC method is far
+// more dependable than dyld symbol interposition, and it lands at ~0.5 s
+// instead of a guessed wall-clock delay.
 
-extern "C" int il2cpp_init(const char *domain_name);
-extern "C" int il2cpp_init_utf16(const uint16_t *domain_name);
+static IMP g_orig_startUnity = NULL;
 
-static int (*orig_il2cpp_init)(const char *);
-static int (*orig_il2cpp_init_utf16)(const uint16_t *);
-static void *g_gameassembly = NULL;
-
-static void *ga_symbol(const char *name)
+static void gbpad_startUnity(id self, SEL _cmd)
 {
-    if (!g_gameassembly)
-        g_gameassembly = dlopen("@rpath/GameAssembly.framework/GameAssembly",
-                                RTLD_NOW | RTLD_GLOBAL);
-    void *p = g_gameassembly ? dlsym(g_gameassembly, name) : NULL;
-    if (!p) p = dlsym(RTLD_NEXT, name);
-    if (!p) p = dlsym(RTLD_DEFAULT, name);
-    return p;
-}
-
-static int hook_il2cpp_init(const char *domain_name)
-{
-    if (!orig_il2cpp_init)
-        orig_il2cpp_init = (int (*)(const char *))ga_symbol("il2cpp_init");
-    if (!orig_il2cpp_init) {
-        // Never swallow the call: letting the engine continue without an
-        // initialised runtime would fail far from here and look unrelated.
-        fprintf(stderr, TAG "FATAL cannot resolve real il2cpp_init\n");
-        return -1;
-    }
-    int rc = orig_il2cpp_init(domain_name);
-    fprintf(stderr, TAG "il2cpp_init returned %d - runtime usable\n", rc);
+    ((void (*)(id, SEL))g_orig_startUnity)(self, _cmd);
+    fprintf(stderr, TAG "startUnity returned - runtime usable\n");
     g_il2cpp_ready = 1;
-    return rc;
 }
 
-static int hook_il2cpp_init_utf16(const uint16_t *domain_name)
+static void install_startunity_hook(void)
 {
-    if (!orig_il2cpp_init_utf16)
-        orig_il2cpp_init_utf16 = (int (*)(const uint16_t *))ga_symbol("il2cpp_init_utf16");
-    if (!orig_il2cpp_init_utf16) {
-        fprintf(stderr, TAG "FATAL cannot resolve real il2cpp_init_utf16\n");
-        return -1;
+    Class c = objc_getClass("UnityAppController");
+    if (!c) {
+        fprintf(stderr, TAG "UnityAppController not registered yet\n");
+        return;
     }
-    int rc = orig_il2cpp_init_utf16(domain_name);
-    fprintf(stderr, TAG "il2cpp_init_utf16 returned %d - runtime usable\n", rc);
-    g_il2cpp_ready = 1;
-    return rc;
+    Method m = class_getInstanceMethod(c, sel_registerName("startUnity:"));
+    if (!m) {
+        fprintf(stderr, TAG "startUnity: not found\n");
+        return;
+    }
+    g_orig_startUnity = method_getImplementation(m);
+    method_setImplementation(m, (IMP)gbpad_startUnity);
+    fprintf(stderr, TAG "startUnity: hooked\n");
 }
 
-__attribute__((used)) static struct {
-    const void *replacement;
-    const void *replacee;
-} interposers[] __attribute__((section("__DATA,__interpose"))) = {
-    { (const void *)(uintptr_t)&hook_il2cpp_init,       (const void *)(uintptr_t)&il2cpp_init },
-    { (const void *)(uintptr_t)&hook_il2cpp_init_utf16, (const void *)(uintptr_t)&il2cpp_init_utf16 },
-};
+// Independent second path. If UnityAppController lives inside UnityFramework it
+// may not be registered yet when this constructor runs, in which case the
+// swizzle above quietly does nothing. The app only becomes active after Unity
+// has launched, so this fires slightly later but never misses.
+static void on_did_become_active(NSNotification *note)
+{
+    (void)note;
+    if (!g_il2cpp_ready) {
+        fprintf(stderr, TAG "applicationDidBecomeActive - runtime usable\n");
+        g_il2cpp_ready = 1;
+    }
+}
 
 // --- helpers ---------------------------------------------------------------
 
@@ -577,28 +584,27 @@ static void *worker(void *unused)
 {
     (void)unused;
 
-    // Gate on elapsed time, not on the hook. Measured on device: managed code
-    // is already running 0.5 s after launch, so by 10 s il2cpp_init has long
-    // returned. Calling into the runtime any earlier is what killed the app in
-    // the first version - il2cpp_domain_get does not return NULL before init,
-    // it returns uninitialised memory.
+    // Wait for startUnity: to return. That is the earliest point at which the
+    // runtime is provably usable, and it lands around 0.5 s - the game is
+    // already playable at 4 s, so a wall-clock gate would be pure dead time.
     //
-    // Progress is logged every 2 s so a short capture still proves the thread
-    // is alive and where it got to.
+    // If the hook was never installed, we stop rather than probe blind: an
+    // early call into il2cpp is what killed the app in the first version.
     int tenths = 0;
-    const int GATE = 100;   // 10.0 s
-    while (!g_il2cpp_ready && tenths < GATE) {
+    const int LIMIT = 300;   // 30 s hard stop
+    while (!g_il2cpp_ready && tenths < LIMIT) {
         usleep(100 * 1000);
         tenths++;
-        if (tenths % 20 == 0)
-            fprintf(stderr, TAG "waiting for runtime: %d.%ds\n", tenths / 10, tenths % 10);
+        if (tenths % 50 == 0)
+            fprintf(stderr, TAG "still waiting for startUnity: %d s\n", tenths / 10);
     }
-    if (g_il2cpp_ready)
-        fprintf(stderr, TAG "hook fired at %d.%ds\n", tenths / 10, tenths % 10);
-    else
-        fprintf(stderr, TAG "hook silent, passing the %d s time gate\n", GATE / 10);
+    if (!g_il2cpp_ready) {
+        fprintf(stderr, TAG "startUnity never fired after %d s, not probing\n", LIMIT / 10);
+        return NULL;
+    }
+    fprintf(stderr, TAG "proceeding at %d.%ds\n", tenths / 10, tenths % 10);
 
-    usleep(500 * 1000);   // let the domain finish coming up
+    usleep(300 * 1000);   // let Input System finish its own static init
 
     if (!bind_api()) {
         fprintf(stderr, TAG "IL2CPP API unreachable from UnityFramework\n");
@@ -627,11 +633,19 @@ static void *worker(void *unused)
 __attribute__((constructor))
 static void gbpad_init(void)
 {
-    fprintf(stderr, TAG "loaded (interpose armed)\n");
+    fprintf(stderr, TAG "loaded\n");
     if (!dlsym(RTLD_DEFAULT, "il2cpp_domain_get")) {
         fprintf(stderr, TAG "il2cpp symbols not global, dlopen GameAssembly\n");
         dlopen("@rpath/GameAssembly.framework/GameAssembly", RTLD_NOW | RTLD_GLOBAL);
     }
+    // Must run before UIApplicationMain, which is why it happens here: this
+    // constructor fires while the app dlopens UnityFramework.
+    install_startunity_hook();
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:UIApplicationDidBecomeActiveNotification
+                    object:nil
+                     queue:nil
+                usingBlock:^(NSNotification *n) { on_did_become_active(n); }];
     pthread_t t;
     if (pthread_create(&t, NULL, worker, NULL) == 0)
         pthread_detach(t);
