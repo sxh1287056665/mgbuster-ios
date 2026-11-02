@@ -290,6 +290,23 @@ static int field_off(Il2CppClass *klass, const char *name)
     return f ? (int)f_field_get_offset(f) : -1;
 }
 
+// Auto-properties and explicit-layout structs do not expose the field name you
+// would guess from the public API, so try the plausible spellings in order.
+static int field_off_any(Il2CppClass *klass, const char *const *names, int n)
+{
+    for (int i = 0; i < n; i++) {
+        int o = field_off(klass, names[i]);
+        if (o >= 0) {
+            fprintf(stderr, TAG "  %s -> @%d\n", names[i], o);
+            return o;
+        }
+    }
+    return -1;
+}
+
+// il2cpp reports struct field offsets including a 16-byte object header.
+static int inner(int reported) { return reported >= 16 ? reported - 16 : -1; }
+
 // Search a class and its ancestors for a method. ReadValue lives on the
 // generic base InputControl<TValue>, not on StickControl itself, so a plain
 // lookup on the concrete class comes back empty.
@@ -316,21 +333,30 @@ static Il2CppClass *g_cStateBlock = NULL;
 static Il2CppClass *g_cInputEvent = NULL;
 static Il2CppClass *g_cStateEvent = NULL;
 static Il2CppClass *g_cStick = NULL;
+static Il2CppClass *g_cGamepadState = NULL;
 
-static int g_stateBlockOff = -1;   // InputDevice.m_StateBlock
-static int g_fmtOff = -1;          // InputStateBlock.format
-static int g_byteOffOff = -1;      // InputStateBlock.byteOffset
-static int g_sizeBitsOff = -1;     // InputStateBlock.sizeInBits
-static int g_deviceIdOff = -1;     // InputDevice.m_DeviceId
+static int g_stateBlockOff = -1;   // InputDevice.m_StateBlock (absolute in object)
+static int g_deviceIdOff = -1;     // InputDevice.m_DeviceId (absolute in object)
 static int g_stateBlockSize = 0;
 
-static int g_evTypeOff = -1;       // InputEvent.m_Type
-static int g_evSizeOff = -1;       // InputEvent.m_SizeInBytes
-static int g_evDeviceOff = -1;     // InputEvent.m_DeviceId
-static int g_stFormatOff = -1;     // StateEvent.stateFormat
-static int g_stSizeOff = -1;       // StateEvent.stateSizeInBytes
-static int g_stOffsetOff = -1;     // StateEvent.stateOffset
-static int g_stTotalSize = 0;      // StateEvent value size == payload offset
+// Offsets below are relative to the START of the containing struct. il2cpp
+// reports struct field offsets as if the struct carried the same 16-byte object
+// header as a class, so the real offset is always (reported - 16). Confirmed
+// against the reported sizes: InputStateBlock reports 16 for a 16-byte struct,
+// GamepadState 28 for a 28-byte struct, InputDevice 376 with its last field at
+// 384 -> 368+8 = 376.
+static int g_fmtOff = -1;          // InputStateBlock.<format>k__BackingField
+static int g_byteOffOff = -1;      // InputStateBlock.m_ByteOffset
+static int g_sizeBitsOff = -1;     // InputStateBlock.<sizeInBits>k__BackingField
+static int g_leftStickOff = 4;     // GamepadState.leftStick - NOT 0, `buttons` is first
+static int g_gamepadStateSize = 0;
+
+static int g_evTypeOff = 12;       // InputEvent.m_Type
+static int g_evSizeOff = 16;       // InputEvent.m_SizeInBytes
+static int g_evDeviceOff = 18;     // InputEvent.m_DeviceId
+static int g_stFormatOff = 20;     // StateEvent.stateFormat
+static int g_payloadOff = 24;      // StateEvent.stateData - where the state bytes go
+static int g_evTypeFound = 0;
 
 static int stage1(void)
 {
@@ -350,6 +376,7 @@ static int stage1(void)
     g_cSys        = f_class_from_name(img, "UnityEngine.InputSystem", "InputSystem");
     g_cStateBlock = f_class_from_name(img, "UnityEngine.InputSystem.LowLevel", "InputStateBlock");
     Il2CppClass *cGamepadState = f_class_from_name(img, "UnityEngine.InputSystem.LowLevel", "GamepadState");
+    g_cGamepadState = cGamepadState;
     g_cInputEvent = f_class_from_name(img, "UnityEngine.InputSystem.LowLevel", "InputEvent");
     g_cStateEvent = f_class_from_name(img, "UnityEngine.InputSystem.LowLevel", "StateEvent");
     g_cStick      = f_class_from_name(img, "UnityEngine.InputSystem.Controls", "StickControl");
@@ -382,32 +409,59 @@ static int stage1(void)
     uint32_t align = 0;
     g_stateBlockOff = field_off(cDevice, "m_StateBlock");
     g_deviceIdOff   = field_off(cDevice, "m_DeviceId");
-    g_fmtOff        = field_off(g_cStateBlock, "format");
-    g_byteOffOff    = field_off(g_cStateBlock, "byteOffset");
-    g_sizeBitsOff   = field_off(g_cStateBlock, "sizeInBits");
-    g_stateBlockSize = f_class_value_size(g_cStateBlock, &align);
 
-    g_evTypeOff   = field_off(g_cInputEvent, "m_Type");
-    g_evSizeOff   = field_off(g_cInputEvent, "m_SizeInBytes");
-    g_evDeviceOff = field_off(g_cInputEvent, "m_DeviceId");
-    g_stFormatOff = field_off(g_cStateEvent, "stateFormat");
-    g_stSizeOff   = field_off(g_cStateEvent, "stateSizeInBytes");
-    g_stOffsetOff = field_off(g_cStateEvent, "stateOffset");
-    g_stTotalSize = f_class_value_size(g_cStateEvent, &align);
+    // InputStateBlock exposes auto-properties, so the metadata fields are the
+    // compiler-generated backing fields. There is no plain `format`/`sizeInBits`.
+    static const char *const fmtNames[]  = {"<format>k__BackingField", "format", "m_Format"};
+    static const char *const byteNames[] = {"m_ByteOffset", "byteOffset"};
+    static const char *const bitsNames[] = {"<sizeInBits>k__BackingField", "sizeInBits", "m_SizeInBits"};
+    g_fmtOff      = inner(field_off_any(g_cStateBlock, fmtNames, 3));
+    g_byteOffOff  = inner(field_off_any(g_cStateBlock, byteNames, 2));
+    g_sizeBitsOff = inner(field_off_any(g_cStateBlock, bitsNames, 3));
+    g_stateBlockSize = f_class_value_size(g_cStateBlock, &align);
+    if (g_stateBlockSize <= 0 || g_stateBlockSize > 64) g_stateBlockSize = 16;
+
+    // GamepadState starts with `buttons` (4 bytes), so leftStick is at 4.
+    static const char *const stickNames[] = {"leftStick"};
+    int fStick = field_off_any(g_cGamepadState, stickNames, 1);
+    g_leftStickOff = inner(fStick);
+    if (g_leftStickOff < 0) g_leftStickOff = 4;
+    g_gamepadStateSize = f_class_value_size(g_cGamepadState, &align);
+    if (g_gamepadStateSize <= 0 || g_gamepadStateSize > 128) g_gamepadStateSize = 28;
+
+    // StateEvent exposes stateSizeInBytes/stateOffset as *properties*; only
+    // baseEvent, stateFormat and stateData exist as fields.
+    static const char *const typeNames[] = {"m_Type", "Type"};
+    static const char *const sizeNames[] = {"m_SizeInBytes", "sizeInBytes"};
+    static const char *const devNames[]  = {"m_DeviceId", "deviceId"};
+    int fType = field_off_any(g_cInputEvent, typeNames, 2);
+    int fSize = field_off_any(g_cInputEvent, sizeNames, 2);
+    int fDev  = field_off_any(g_cInputEvent, devNames, 2);
+    if (inner(fType) >= 0) { g_evTypeOff = inner(fType); g_evTypeFound = 1; }
+    if (inner(fSize) >= 0) g_evSizeOff = inner(fSize);
+    if (inner(fDev)  >= 0) g_evDeviceOff = inner(fDev);
+
+    static const char *const sfNames[] = {"stateFormat"};
+    static const char *const sdNames[] = {"stateData"};
+    int fSf = field_off_any(g_cStateEvent, sfNames, 1);
+    int fSd = field_off_any(g_cStateEvent, sdNames, 1);
+    if (inner(fSf) >= 0) g_stFormatOff = inner(fSf);
+    if (inner(fSd) >= 0) g_payloadOff  = inner(fSd);
 
     fprintf(stderr, TAG "resolved device: m_StateBlock@%d(size %d) m_DeviceId@%d\n",
             g_stateBlockOff, g_stateBlockSize, g_deviceIdOff);
     fprintf(stderr, TAG "resolved block : format@%d byteOffset@%d sizeInBits@%d\n",
             g_fmtOff, g_byteOffOff, g_sizeBitsOff);
-    fprintf(stderr, TAG "resolved event : m_Type@%d m_SizeInBytes@%d m_DeviceId@%d\n",
-            g_evTypeOff, g_evSizeOff, g_evDeviceOff);
-    fprintf(stderr, TAG "resolved state : stateFormat@%d stateSizeInBytes@%d stateOffset@%d total=%d\n",
-            g_stFormatOff, g_stSizeOff, g_stOffsetOff, g_stTotalSize);
+    fprintf(stderr, TAG "resolved gamepad: leftStick@%d size=%d\n",
+            g_leftStickOff, g_gamepadStateSize);
+    fprintf(stderr, TAG "resolved event : m_Type@%d%s m_SizeInBytes@%d m_DeviceId@%d\n",
+            g_evTypeOff, g_evTypeFound ? "" : " (DEFAULT)", g_evSizeOff, g_evDeviceOff);
+    fprintf(stderr, TAG "resolved state : stateFormat@%d payload@%d\n",
+            g_stFormatOff, g_payloadOff);
 
     if (g_stateBlockOff < 0 || g_deviceIdOff < 0 || g_fmtOff < 0 ||
-        g_byteOffOff < 0 || g_sizeBitsOff < 0 || g_stateBlockSize <= 0 ||
-        g_evTypeOff < 0 || g_evSizeOff < 0 || g_evDeviceOff < 0 ||
-        g_stFormatOff < 0 || g_stSizeOff < 0 || g_stOffsetOff < 0 || g_stTotalSize <= 0) {
+        g_byteOffOff < 0 || g_sizeBitsOff < 0 ||
+        g_stFormatOff < 0 || g_payloadOff < 0) {
         fprintf(stderr, TAG "cannot resolve required offsets\n");
         return -1;
     }
@@ -477,7 +531,10 @@ static int stage2(void)
     fprintf(stderr, TAG "device: id=%d format=0x%08x byteOffset=%u sizeInBits=%u\n",
             devId, fmt, byteOffset, sizeInBits);
 
-    uint32_t stateBytes = (sizeInBits + 7) / 8;
+    // The event payload is the GamepadState struct. Its declared size is the
+    // authority here - the state block's sizeInBits can be narrower than the
+    // struct because the device only exposes part of it.
+    uint32_t stateBytes = (uint32_t)g_gamepadStateSize;
     if (stateBytes == 0 || stateBytes > 128) {
         fprintf(stderr, TAG "implausible state size %u, skipping stage 2\n", stateBytes);
         return -1;
@@ -496,24 +553,22 @@ static int stage2(void)
         fprintf(stderr, TAG "format 0x%08x not GPAD, assuming big-endian\n", fmt);
     }
 
-    // StateEvent's declared size is exactly where the payload begins.
-    const int kPayload = g_stTotalSize;
-    unsigned char *ev = (unsigned char *)calloc(1, kPayload + stateBytes);
+    unsigned char *ev = (unsigned char *)calloc(1, g_payloadOff + stateBytes);
     if (!ev) return -1;
 
-    uint32_t total = (uint32_t)(kPayload + stateBytes);
+    uint32_t total = (uint32_t)(g_payloadOff + stateBytes);
     memcpy(ev + g_evTypeOff, &evType, 4);
     uint16_t sz16 = (uint16_t)total;
     memcpy(ev + g_evSizeOff, &sz16, 2);
-    memcpy(ev + g_evDeviceOff, &devId, 4);
+    // m_DeviceId is a ushort in InputEvent; writing 4 bytes here would clobber
+    // whatever follows it.
+    uint16_t devId16 = (uint16_t)devId;
+    memcpy(ev + g_evDeviceOff, &devId16, 2);
     memcpy(ev + g_stFormatOff, &fmt, 4);
-    memcpy(ev + g_stSizeOff, &stateBytes, 4);
-    uint32_t payloadOff = (uint32_t)kPayload;
-    memcpy(ev + g_stOffsetOff, &payloadOff, 4);
 
-    // Synthetic pattern: leftStick pushed to +X. GamepadState keeps leftStick
-    // as its first two floats.
-    float *state = (float *)(ev + kPayload);
+    // Synthetic pattern: leftStick pushed to +X. leftStick sits at +4 inside
+    // GamepadState because `buttons` occupies the first 4 bytes.
+    float *state = (float *)(ev + g_payloadOff + g_leftStickOff);
     state[0] = 0.60f;
     state[1] = 0.00f;
 
@@ -533,8 +588,8 @@ static int stage2(void)
         free(ev);
         return -1;
     }
-    fprintf(stderr, TAG "QUEUED type=0x%08x dev=%d stateBytes=%u leftStick=(%.2f,%.2f)\n",
-            evType, devId, stateBytes, state[0], state[1]);
+    fprintf(stderr, TAG "QUEUED type=0x%08x dev=%d total=%u stick@%d leftStick=(%.2f,%.2f)\n",
+            evType, devId, total, g_payloadOff + g_leftStickOff, state[0], state[1]);
     free(ev);
 
     // Let the player loop consume the event. Calling InputSystem.Update() from
