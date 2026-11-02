@@ -80,6 +80,17 @@ workflows:
           fi
           echo "build script reported success"
 
+      - name: Patch audio bootstrap
+        script: |
+          set -e
+          cd "$CM_BUILD_DIR"
+          # startUnity: calls UnityEngine.AudioSettings/Mobile::InvokeOnMuteStateChanged,
+          # a mobile-only managed class that the macOS il2cpp build stripped.
+          # LookupMethod returns null and the caller dereferences it -> SIGSEGV.
+          APP="out/build/Release-iphoneos/SiNiSistar2.app"
+          python3 patch_audio_proxy.py \
+            "$APP/Frameworks/UnityFramework.framework/UnityFramework" --no-backup
+
       - name: Inspect app
         script: |
           set -e
