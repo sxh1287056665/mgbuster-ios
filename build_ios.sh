@@ -1,4 +1,4 @@
-﻿#!/bin/bash
+#!/bin/bash
 # =============================================================================
 # SiNiSistar2 -> iOS app package
 #
@@ -101,6 +101,20 @@ xcrun --sdk iphoneos clang++ -arch arm64 -mios-version-min=11.0 -O2 -std=c++17 \
 xcrun --sdk iphoneos libtool -static -o "$STUB/libUnityGeneratedStubs.a" "$STUB/UnityGeneratedStubs.o" \
     || { log "generated-stub archive failed"; exit 1; }
 log "   libUnityGeneratedStubs.a $(du -h "$STUB/libUnityGeneratedStubs.a" | cut -f1)  (RegisterAllClasses etc.)"
+
+# 3c. virtual gamepad bridge
+# The Input System's iOS backend is absent from this binary (it came from a
+# macOS player build), so no Gamepad device is ever created and the game's
+# <Gamepad> bindings have nothing to bind to. gbpad.mm talks to the IL2CPP
+# runtime directly to instantiate one. force_load is required: nothing
+# references its symbols, so the linker would otherwise drop the object and
+# its constructor would never run.
+xcrun --sdk iphoneos clang++ -arch arm64 -mios-version-min=11.0 -O2 -std=c++17 \
+    -fobjc-arc -c "$ROOT/gbpad.mm" -o "$STUB/gbpad.o" \
+    || { log "gbpad compile failed"; exit 1; }
+xcrun --sdk iphoneos libtool -static -o "$STUB/libgbpad.a" "$STUB/gbpad.o" \
+    || { log "gbpad archive failed"; exit 1; }
+log "   libgbpad.a              $(du -h "$STUB/libgbpad.a" | cut -f1)  (virtual gamepad)"
 
 log ""
 log "== 4. repackage GameAssembly.dylib as a framework =="
@@ -227,7 +241,7 @@ ENGINE="$PAYLOAD/Libraries/libiPhone-lib.a"
 # dylib through that variable scopes them to the framework: OTHER_LDFLAGS itself
 # applies to every target, which would force-load the 196 MB engine into the app
 # binary as well - two engine copies in one process.
-LDFLAGS="-ObjC -Wl,-force_load,$ENGINE $STUB/libUnityGeneratedStubs.a $DYLIB -Wl,-search_paths_first"
+LDFLAGS="-ObjC -Wl,-force_load,$ENGINE -Wl,-force_load,$STUB/libgbpad.a $STUB/libUnityGeneratedStubs.a $DYLIB -Wl,-search_paths_first"
 
 # Unity writes UNITY_VERSION_* into the pbxproj at build time; the Trampoline
 # template ships with zero occurrences. UnityTrampolineConfigure.h:8 checks them
