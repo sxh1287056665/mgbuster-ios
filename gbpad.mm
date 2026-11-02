@@ -337,6 +337,10 @@ static void exc_message(Il2CppException *exc, char *out, size_t n)
 // Search a class and its ancestors for a method. ReadValue lives on the
 // generic base InputControl<TValue>, not on StickControl itself, so a plain
 // lookup on the concrete class comes back empty.
+//
+// Kept as a fallback only. On device this walked the chain from StickControl
+// and returned nothing - the chain crosses the generic InputControl<Vector2>
+// instantiation, and il2cpp_class_get_parent does not traverse that reliably.
 static MethodInfo *find_method_up(Il2CppClass *klass, const char *name, int argc, int maxDepth)
 {
     Il2CppClass *k = klass;
@@ -361,6 +365,15 @@ static Il2CppClass *g_cInputEvent = NULL;
 static Il2CppClass *g_cStateEvent = NULL;
 static Il2CppClass *g_cStick = NULL;
 static Il2CppClass *g_cGamepadState = NULL;
+static Il2CppClass *g_cInputControl = NULL;
+static MethodInfo *g_readValueAsObject = NULL;
+
+// Kept alive so the state can be re-queued. QueueEvent copies the event into
+// its own buffer, so one allocation can be fed repeatedly.
+static void *g_evBuffer = NULL;
+static uint32_t g_evBufferSize = 0;
+static MethodInfo *g_queueMethod = NULL;
+static int g_injectTicks = 0;
 
 static MethodInfo *g_addMethod = NULL;
 static Il2CppString *g_sLayout = NULL;
@@ -368,6 +381,7 @@ static Il2CppString *g_sName = NULL;
 
 static int stage2(void);
 static void gbpad_readback(void);
+static void gbpad_inject_tick(void);
 static void gbpad_create_device(int attempt);
 
 static int g_stateBlockOff = -1;   // InputDevice.m_StateBlock (absolute in object)
@@ -415,6 +429,7 @@ static int stage1(void)
     g_cInputEvent = f_class_from_name(img, "UnityEngine.InputSystem.LowLevel", "InputEvent");
     g_cStateEvent = f_class_from_name(img, "UnityEngine.InputSystem.LowLevel", "StateEvent");
     g_cStick      = f_class_from_name(img, "UnityEngine.InputSystem.Controls", "StickControl");
+    g_cInputControl = f_class_from_name(img, "UnityEngine.InputSystem", "InputControl");
 
     fprintf(stderr, TAG "class Gamepad         %s\n", g_cGamepad ? "ok" : "MISSING");
     fprintf(stderr, TAG "class InputDevice     %s\n", cDevice ? "ok" : "MISSING");
@@ -424,6 +439,7 @@ static int stage1(void)
     fprintf(stderr, TAG "class InputEvent      %s\n", g_cInputEvent ? "ok" : "MISSING");
     fprintf(stderr, TAG "class StateEvent      %s\n", g_cStateEvent ? "ok" : "MISSING");
     fprintf(stderr, TAG "class StickControl    %s\n", g_cStick ? "ok" : "MISSING");
+    fprintf(stderr, TAG "class InputControl    %s\n", g_cInputControl ? "ok" : "MISSING");
 
     // The layout dump is the contract for stage 2. Offsets are re-derived at
     // runtime, but printing them makes a mismatch obvious instead of silently
@@ -440,6 +456,20 @@ static int stage1(void)
         fprintf(stderr, TAG "required classes missing\n");
         return -1;
     }
+
+    // ReadValueAsObject is declared on InputControl, the non-generic base.
+    // Walking up from StickControl failed on device, so ask for the class by
+    // name and read the method straight off it. The chain walk stays as a
+    // fallback in case the class is renamed.
+    if (g_cInputControl) {
+        g_readValueAsObject = f_class_get_method_from_name(g_cInputControl, "ReadValueAsObject", 0);
+        if (g_readValueAsObject)
+            fprintf(stderr, TAG "ReadValueAsObject on InputControl\n");
+    }
+    if (!g_readValueAsObject && g_cStick)
+        g_readValueAsObject = find_method_up(g_cStick, "ReadValueAsObject", 0, 12);
+    if (!g_readValueAsObject)
+        fprintf(stderr, TAG "WARN ReadValueAsObject unresolved, readback will be skipped\n");
 
     uint32_t align = 0;
     g_stateBlockOff = field_off(cDevice, "m_StateBlock");
@@ -593,26 +623,60 @@ static int stage2(void)
         free(ev);
         return -1;
     }
+    g_queueMethod = queue;
 
     void *eventPtrValue = ev;
     void *args[1] = { &eventPtrValue };
     Il2CppException *exc = NULL;
     f_runtime_invoke(queue, NULL, args, &exc);
     if (exc) {
-        fprintf(stderr, TAG "QueueEvent threw (exception %p)\n", (void *)exc);
+        char msg[256];
+        exc_message(exc, msg, sizeof msg);
+        fprintf(stderr, TAG "QueueEvent threw: %s\n", msg);
         free(ev);
         return -1;
     }
     fprintf(stderr, TAG "QUEUED type=0x%08x dev=%d total=%u stick@%d leftStick=(%.2f,%.2f)\n",
             evType, devId, total, g_payloadOff + g_leftStickOff, state[0], state[1]);
-    free(ev);
 
-    // The player loop consumes queued events on its own InputSystem.Update().
-    // Sleeping here would work but this now runs on the main thread, so it
-    // would freeze the game for the duration. Come back later instead.
+    // QueueEvent copies the event into its own buffer, so this allocation can
+    // be fed again. Keep it: the state has to be re-asserted every frame or so,
+    // because the Input System treats each update as a fresh state and the
+    // stick would fall back to zero once the single event ages out.
+    g_evBuffer = ev;
+    g_evBufferSize = total;
+    g_injectTicks = 15;   // 15 x 200 ms = 3 s of held deflection
+
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{ gbpad_readback(); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{ gbpad_inject_tick(); });
     return 0;
+}
+
+// Hold the deflection for a few seconds so the effect is visible in-game, then
+// stop. This doubles as the visual confirmation: if the character walks, the
+// whole chain works.
+static void gbpad_inject_tick(void)
+{
+    if (!g_device || !g_evBuffer || !g_queueMethod || g_injectTicks <= 0) {
+        fprintf(stderr, TAG "injection stopped\n");
+        return;
+    }
+    g_injectTicks--;
+
+    void *ptr = g_evBuffer;
+    void *args[1] = { &ptr };
+    Il2CppException *exc = NULL;
+    f_runtime_invoke(g_queueMethod, NULL, args, &exc);
+    if (exc) {
+        char msg[256];
+        exc_message(exc, msg, sizeof msg);
+        fprintf(stderr, TAG "re-queue threw: %s\n", msg);
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{ gbpad_inject_tick(); });
 }
 
 // Read back through the managed API - the proof the chain works, with no
@@ -621,7 +685,7 @@ static void gbpad_readback(void)
 {
     MethodInfo *getCurrent = f_class_get_method_from_name(g_cGamepad, "get_current", 0);
     MethodInfo *getStick = f_class_get_method_from_name(g_cGamepad, "get_leftStick", 0);
-    MethodInfo *readObj = g_cStick ? find_method_up(g_cStick, "ReadValueAsObject", 0, 12) : NULL;
+    MethodInfo *readObj = g_readValueAsObject;
 
     if (!getCurrent || !getStick || !readObj) {
         fprintf(stderr, TAG "readback unavailable (get_current=%p get_leftStick=%p ReadValueAsObject=%p)\n",
