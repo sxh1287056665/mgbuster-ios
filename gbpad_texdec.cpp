@@ -580,10 +580,17 @@ void *gbpad_decode(int srcFmt, int dstFmt, int w, int h,
                    const void *src, int srcW, int srcH, void *dst)
 {
     (void)srcH;
+    // The engine asks for the sRGB variant, not the linear one: a 512x720 BC7
+    // arrives as dstFmt 4 (RGBA32_SRGB), never 8 (RGBA32_UNorm). Both are four
+    // bytes per pixel, so the same write serves either. Getting this wrong cost
+    // a build: every request was refused at the door and 284 textures failed
+    // with the decoder never having been entered once.
+    const int dstIsRGBA32 = (dstFmt == 4 || dstFmt == 8);
+
     // Anything we cannot reproduce exactly returns NULL, and the naked stub
     // above hands control back to the original body so current behaviour is
     // preserved bit for bit.
-    if (src && dst && w > 0 && h > 0 && dstFmt == 8) {
+    if (src && dst && w > 0 && h > 0 && dstIsRGBA32) {
         switch (srcFmt) {
         case 96:   // DXT1 sRGB
         case 97:   // DXT1 linear
