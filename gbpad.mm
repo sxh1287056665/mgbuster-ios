@@ -1671,9 +1671,19 @@ static void gbpad_install_overlay(int attempt)
 
 static void gbpad_install_gamecontroller(void)
 {
+    // No link-time dependency: pull the framework in on demand. iOS does not
+    // load GameController by default, so objc_getClass returns nil until it is
+    // mapped - and adding -framework GameController would tie the build to the
+    // SDK having that framework present.
     Class gc = objc_getClass("GCController");
     if (!gc) {
-        fprintf(stderr, TAG "GameController framework not linked\n");
+        void *h = dlopen("/System/Library/Frameworks/GameController.framework/GameController",
+                         RTLD_NOW);
+        fprintf(stderr, TAG "GameController dlopen -> %s\n", h ? "ok" : dlerror());
+        gc = objc_getClass("GCController");
+    }
+    if (!gc) {
+        fprintf(stderr, TAG "GCController unavailable, physical pads disabled\n");
         return;
     }
 
