@@ -392,6 +392,19 @@ static int g_stepCaptured = 0;
 static int g_stepChecked = 0;
 static int g_manualUpdate = 0;
 
+// Keyboard injection. The main menu of a PC game is far more likely to listen to
+// Enter or Space than to a gamepad button, so both get tried in one run.
+static Il2CppClass *g_cKeyboard = NULL;
+static Il2CppClass *g_cKeyControl = NULL;
+static Il2CppObject *g_kbDevice = NULL;
+static void *g_kbBuffer = NULL;
+static uint32_t g_kbTotal = 0;
+static uint32_t g_kbFormat = 0;
+static uint32_t g_kbDevId = 0;
+static int g_kbByteOff = -1;    // per-key byte offset inside the keyboard state
+static int g_kbBitOff = -1;     // per-key bit within that byte
+static int g_bitOffOff = -1;    // offset of InputStateBlock.bitOffset
+
 static MethodInfo *g_addMethod = NULL;
 static Il2CppString *g_sLayout = NULL;
 static Il2CppString *g_sName = NULL;
@@ -400,6 +413,8 @@ static int stage2(void);
 static void gbpad_readback(void);
 static void gbpad_inject_tick(void);
 static void gbpad_create_device(int attempt);
+static void gbpad_make_keyboard(void);
+static float gbpad_mag(void);
 
 static int g_stateBlockOff = -1;   // InputDevice.m_StateBlock (absolute in object)
 static int g_deviceIdOff = -1;     // InputDevice.m_DeviceId (absolute in object)
@@ -447,6 +462,8 @@ static int stage1(void)
     g_cStateEvent = f_class_from_name(img, "UnityEngine.InputSystem.LowLevel", "StateEvent");
     g_cStick      = f_class_from_name(img, "UnityEngine.InputSystem.Controls", "StickControl");
     g_cInputControl = f_class_from_name(img, "UnityEngine.InputSystem", "InputControl");
+    g_cKeyboard   = f_class_from_name(img, "UnityEngine.InputSystem", "Keyboard");
+    g_cKeyControl = f_class_from_name(img, "UnityEngine.InputSystem.Controls", "KeyControl");
 
     fprintf(stderr, TAG "class Gamepad         %s\n", g_cGamepad ? "ok" : "MISSING");
     fprintf(stderr, TAG "class InputDevice     %s\n", cDevice ? "ok" : "MISSING");
@@ -457,6 +474,8 @@ static int stage1(void)
     fprintf(stderr, TAG "class StateEvent      %s\n", g_cStateEvent ? "ok" : "MISSING");
     fprintf(stderr, TAG "class StickControl    %s\n", g_cStick ? "ok" : "MISSING");
     fprintf(stderr, TAG "class InputControl    %s\n", g_cInputControl ? "ok" : "MISSING");
+    fprintf(stderr, TAG "class Keyboard        %s\n", g_cKeyboard ? "ok" : "MISSING");
+    fprintf(stderr, TAG "class KeyControl      %s\n", g_cKeyControl ? "ok" : "MISSING");
 
     // The layout dump is the contract for stage 2. Offsets are re-derived at
     // runtime, but printing them makes a mismatch obvious instead of silently
@@ -509,6 +528,9 @@ static int stage1(void)
     g_fmtOff      = inner(field_off_any(g_cStateBlock, fmtNames, 3));
     g_byteOffOff  = inner(field_off_any(g_cStateBlock, byteNames, 2));
     g_sizeBitsOff = inner(field_off_any(g_cStateBlock, bitsNames, 3));
+    static const char *const bitNames[] = {"<bitOffset>k__BackingField", "bitOffset", "m_BitOffset"};
+    g_bitOffOff = inner(field_off_any(g_cStateBlock, bitNames, 3));
+    fprintf(stderr, TAG "InputStateBlock bitOffset @%d\n", g_bitOffOff);
     g_stateBlockSize = f_class_value_size(g_cStateBlock, &align);
     if (g_stateBlockSize <= 0 || g_stateBlockSize > 64) g_stateBlockSize = 16;
 
@@ -688,6 +710,139 @@ static int stage2(void)
     return 0;
 }
 
+// --- measurement -----------------------------------------------------------
+
+// EvaluateMagnitude returns a plain float, so this needs no layout guesswork.
+// -1 means "could not read", which is different from a real 0.
+static float gbpad_mag(void)
+{
+    if (!g_evalMagnitude || !g_cGamepad) return -1.0f;
+    MethodInfo *getCurrent = f_class_get_method_from_name(g_cGamepad, "get_current", 0);
+    MethodInfo *getStick = f_class_get_method_from_name(g_cGamepad, "get_leftStick", 0);
+    if (!getCurrent || !getStick) return -1.0f;
+
+    Il2CppException *e = NULL;
+    Il2CppObject *cur = f_runtime_invoke(getCurrent, NULL, NULL, &e);
+    if (!cur || e) return -1.0f;
+    e = NULL;
+    Il2CppObject *stick = f_runtime_invoke(getStick, cur, NULL, &e);
+    if (!stick || e) return -1.0f;
+    e = NULL;
+    Il2CppObject *boxed = f_runtime_invoke(g_evalMagnitude, stick, NULL, &e);
+    if (!boxed || e) return -1.0f;
+    return *(float *)((unsigned char *)boxed + 2 * sizeof(void *));
+}
+
+// --- keyboard injection ----------------------------------------------------
+// The main menu of a PC game is more likely to answer to Enter than to a
+// gamepad face button, and the game's metadata carries both input APIs. A
+// Keyboard device is built exactly like the gamepad was, and the per-key bit
+// position is read off the real KeyControl instead of hardcoding Key enum
+// values.
+
+static void gbpad_make_keyboard(void)
+{
+    if (g_kbDevice || !g_cKeyboard || !g_addMethod) {
+        fprintf(stderr, TAG "keyboard: skipped (device=%p class=%p add=%p)\n",
+                (void *)g_kbDevice, (void *)g_cKeyboard, (void *)g_addMethod);
+        return;
+    }
+
+    Il2CppString *layout = f_string_new("Keyboard");
+    Il2CppString *name   = f_string_new("GBPadKB");
+    void *args[3] = { layout, name, NULL };
+    Il2CppException *exc = NULL;
+    Il2CppObject *dev = f_runtime_invoke(g_addMethod, NULL, args, &exc);
+    if (!dev || exc) {
+        char msg[256];
+        exc_message(exc, msg, sizeof msg);
+        fprintf(stderr, TAG "keyboard AddDevice failed: %s\n", exc ? msg : "returned null");
+        return;
+    }
+    g_kbDevice = dev;
+    fprintf(stderr, TAG "KEYBOARD CREATED at %p\n", (void *)dev);
+
+    unsigned char *d = (unsigned char *)dev;
+    uint32_t fmt = 0, bits = 0;
+    memcpy(&fmt,  d + g_stateBlockOff + g_fmtOff, 4);
+    memcpy(&bits, d + g_stateBlockOff + g_sizeBitsOff, 4);
+    g_kbFormat = fmt;
+
+    uint32_t stateBytes = bits / 8;
+    if (stateBytes == 0 || stateBytes > 64) stateBytes = 14;   // KeyboardState default
+
+    uint16_t id16 = 0;
+    memcpy(&id16, d + g_deviceIdOff, 2);
+    g_kbDevId = id16;
+
+    uint32_t total = (uint32_t)g_payloadOff + stateBytes;
+    g_kbTotal = total;
+    g_kbBuffer = calloc(1, total);
+    if (!g_kbBuffer) { fprintf(stderr, TAG "keyboard: alloc failed\n"); return; }
+
+    // Same packing rule the gamepad resolved to: FourCC reads as big-endian.
+    uint32_t evType = (fmt == 0x44415047u) ? 0x54415453u : 0x53544154u;
+    uint16_t sz16 = (uint16_t)total;
+    memcpy((unsigned char *)g_kbBuffer + g_evTypeOff, &evType, 4);
+    memcpy((unsigned char *)g_kbBuffer + g_evSizeOff, &sz16, 2);
+    memcpy((unsigned char *)g_kbBuffer + g_evDeviceOff, &id16, 2);
+    memcpy((unsigned char *)g_kbBuffer + g_stFormatOff, &fmt, 4);
+
+    fprintf(stderr, TAG "keyboard: id=%u format=0x%08x state=%u bytes total=%u\n",
+            g_kbDevId, g_kbFormat, stateBytes, total);
+
+    MethodInfo *cur = f_class_get_method_from_name(g_cKeyboard, "get_current", 0);
+    if (cur) {
+        Il2CppException *e2 = NULL;
+        Il2CppObject *c = f_runtime_invoke(cur, NULL, NULL, &e2);
+        fprintf(stderr, TAG "Keyboard.current -> %p%s\n", (void *)c,
+                (c == dev) ? "  (matches)" : "");
+    }
+}
+
+// Flip one key's bit in the keyboard state buffer. The bit position comes from
+// the live KeyControl's state block, so no Key enum table is assumed.
+static int gbpad_kb_set(const char *getterName, int down)
+{
+    if (!g_kbDevice || !g_kbBuffer || !g_cKeyboard) return 0;
+    MethodInfo *getter = f_class_get_method_from_name(g_cKeyboard, getterName, 0);
+    if (!getter) { fprintf(stderr, TAG "keyboard: %s not found\n", getterName); return 0; }
+
+    Il2CppException *e = NULL;
+    Il2CppObject *kc = f_runtime_invoke(getter, g_kbDevice, NULL, &e);
+    if (!kc || e) { fprintf(stderr, TAG "keyboard: %s returned null\n", getterName); return 0; }
+
+    unsigned char *c = (unsigned char *)kc;
+    uint32_t byteOff = 0, bitOff = 0;
+    memcpy(&byteOff, c + g_stateBlockOff + g_byteOffOff, 4);
+    memcpy(&bitOff,  c + g_stateBlockOff + g_bitOffOff, 4);
+
+    uint32_t stateBytes = g_kbTotal - (uint32_t)g_payloadOff;
+    if (byteOff >= stateBytes || bitOff > 7) {
+        fprintf(stderr, TAG "keyboard: %s out of range (byte=%u bit=%u of %u)\n",
+                getterName, byteOff, bitOff, stateBytes);
+        return 0;
+    }
+    unsigned char *st = (unsigned char *)g_kbBuffer + g_payloadOff + byteOff;
+    if (down) *st |=  (unsigned char)(1u << bitOff);
+    else      *st &= (unsigned char)~(1u << bitOff);
+    return 1;
+}
+
+static void gbpad_kb_queue(void)
+{
+    if (!g_kbDevice || !g_kbBuffer || !g_queueMethod) return;
+    void *ptr = g_kbBuffer;
+    void *args[1] = { &ptr };
+    Il2CppException *exc = NULL;
+    f_runtime_invoke(g_queueMethod, NULL, args, &exc);
+    if (exc) {
+        char msg[256];
+        exc_message(exc, msg, sizeof msg);
+        fprintf(stderr, TAG "keyboard re-queue threw: %s\n", msg);
+    }
+}
+
 // Walk a short scripted sequence so one install answers three questions at
 // once: does an axis reach the game, do buttons reach the game, and does the
 // menu respond. The game binds <Gamepad>/buttonSouth and <Keyboard>/x to jump
@@ -727,14 +882,50 @@ static void gbpad_inject_tick(void)
         int down = (g_tick % 2) == 1;
         if (g_buttonsPtr) *g_buttonsPtr = down ? 4096u : 0u;  // GamepadButton.Start
         fprintf(stderr, TAG "  Start %s\n", down ? "down" : "up");
-        if (g_tick > 4) stop = 1;
+        if (g_tick > 4) {
+            if (g_buttonsPtr) *g_buttonsPtr = 0u;
+            g_phase = 3;
+            g_tick = 0;
+            fprintf(stderr, TAG "phase 4: keyboard Enter\n");
+        }
+    } else if (g_phase == 3) {
+        g_tick++;
+        int down = (g_tick % 2) == 1;
+        gbpad_kb_set("get_enterKey", down);
+        fprintf(stderr, TAG "  Enter %s\n", down ? "down" : "up");
+        if (g_tick > 8) {
+            gbpad_kb_set("get_enterKey", 0);
+            g_phase = 4;
+            g_tick = 0;
+            fprintf(stderr, TAG "phase 5: keyboard Space\n");
+        }
+    } else if (g_phase == 4) {
+        g_tick++;
+        int down = (g_tick % 2) == 1;
+        gbpad_kb_set("get_spaceKey", down);
+        fprintf(stderr, TAG "  Space %s\n", down ? "down" : "up");
+        if (g_tick > 6) {
+            gbpad_kb_set("get_spaceKey", 0);
+            g_phase = 5;
+            g_tick = 0;
+            fprintf(stderr, TAG "phase 6: keyboard X\n");
+        }
+    } else if (g_phase == 5) {
+        g_tick++;
+        int down = (g_tick % 2) == 1;
+        gbpad_kb_set("get_xKey", down);
+        fprintf(stderr, TAG "  X %s\n", down ? "down" : "up");
+        if (g_tick > 6) {
+            gbpad_kb_set("get_xKey", 0);
+            stop = 1;
+        }
     } else {
         stop = 1;
     }
 
     if (stop) {
         if (g_buttonsPtr) *g_buttonsPtr = 0u;
-        g_phase = 3;
+        g_phase = 6;
         fprintf(stderr, TAG "injection finished\n");
         return;
     }
@@ -787,12 +978,24 @@ static void gbpad_inject_tick(void)
         fprintf(stderr, TAG "re-queue threw: %s\n", msg);
         return;
     }
+    gbpad_kb_queue();
 
     // Drain again so the state we just queued actually lands in the device
     // buffer before the next frame reads it.
     if (g_manualUpdate && g_sysUpdate) {
         Il2CppException *ue2 = NULL;
         f_runtime_invoke(g_sysUpdate, NULL, NULL, &ue2);
+    }
+
+    // The whole point of this build: read the stick back AFTER a manual update
+    // has run. If the magnitude finally moves, pumping works and the queue was
+    // simply never drained. If it stays at zero, the events are being rejected
+    // or Update() is not the thing that drains them.
+    if (g_manualUpdate && (g_tick % 3) == 0) {
+        uint32_t step = (g_updateStepOff >= 0)
+            ? *(uint32_t *)((unsigned char *)g_device + g_updateStepOff) : 0;
+        float m = gbpad_mag();
+        fprintf(stderr, TAG "  [after manual update] step=%u mag=%.3f\n", step, m);
     }
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
@@ -803,39 +1006,12 @@ static void gbpad_inject_tick(void)
 // controller involved and no gameplay side effects beyond the stick value.
 static void gbpad_readback(void)
 {
-    MethodInfo *getCurrent = f_class_get_method_from_name(g_cGamepad, "get_current", 0);
-    MethodInfo *getStick = f_class_get_method_from_name(g_cGamepad, "get_leftStick", 0);
-
-    if (!getCurrent || !getStick || !g_evalMagnitude) {
-        fprintf(stderr, TAG "readback unavailable (get_current=%p get_leftStick=%p EvaluateMagnitude=%p)\n",
-                (void *)getCurrent, (void *)getStick, (void *)g_evalMagnitude);
+    float mag = gbpad_mag();
+    if (mag < 0.0f) {
+        fprintf(stderr, TAG "readback unavailable (EvaluateMagnitude=%p)\n",
+                (void *)g_evalMagnitude);
         return;
     }
-
-    Il2CppException *e1 = NULL;
-    Il2CppObject *cur = f_runtime_invoke(getCurrent, NULL, NULL, &e1);
-    if (!cur || e1) {
-        fprintf(stderr, TAG "readback: Gamepad.current null\n");
-        return;
-    }
-    Il2CppException *e2 = NULL;
-    Il2CppObject *stick = f_runtime_invoke(getStick, cur, NULL, &e2);
-    if (!stick || e2) {
-        fprintf(stderr, TAG "readback: leftStick control null\n");
-        return;
-    }
-
-    // EvaluateMagnitude returns a float. il2cpp boxes it, so the payload sits
-    // right after the two-word object header - no layout guesswork beyond that.
-    Il2CppException *e3 = NULL;
-    Il2CppObject *boxed = f_runtime_invoke(g_evalMagnitude, stick, NULL, &e3);
-    if (!boxed || e3) {
-        char msg[256];
-        exc_message(e3, msg, sizeof msg);
-        fprintf(stderr, TAG "readback: EvaluateMagnitude failed: %s\n", msg);
-        return;
-    }
-    float mag = *(float *)((unsigned char *)boxed + 2 * sizeof(void *));
     fprintf(stderr, TAG "READBACK leftStick magnitude = %.3f%s\n", mag,
             (mag > 0.3f) ? "   <== INJECTION WORKS" : "   <== did not take");
 }
@@ -887,6 +1063,8 @@ static void gbpad_create_device(int attempt)
     }
 
     // Give the player loop a frame to register the device before feeding state.
+    gbpad_make_keyboard();
+
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{ stage2(); });
 }
