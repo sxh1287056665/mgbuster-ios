@@ -261,6 +261,28 @@ static Il2CppImage *find_image(Il2CppDomain *domain, const char *needle)
     return NULL;
 }
 
+// Look a type up in every loaded assembly. InputSystem's event header is
+// declared in UnityEngineInternal.Input, which lives in a different assembly
+// from InputSystem itself, so a lookup restricted to the InputSystem image
+// silently returns null and the caller falls back to guessed offsets.
+static Il2CppClass *find_class_any(Il2CppDomain *domain, const char *ns, const char *name)
+{
+    size_t n = 0;
+    const Il2CppAssembly **asms = f_domain_get_assemblies(domain, &n);
+    if (!asms) return NULL;
+    for (size_t i = 0; i < n; i++) {
+        Il2CppImage *im = f_assembly_get_image(asms[i]);
+        if (!im) continue;
+        Il2CppClass *k = f_class_from_name(im, ns, name);
+        if (k) {
+            const char *in = f_image_get_name(im);
+            fprintf(stderr, TAG "found %s.%s in %s\n", ns, name, in ? in : "?");
+            return k;
+        }
+    }
+    return NULL;
+}
+
 static void dump_fields(Il2CppClass *klass, const char *label)
 {
     if (!klass) {
@@ -423,10 +445,16 @@ static uint32_t g_kbDevByteOff = 0;  // keyboard device root, absolute in the gl
 static uint32_t g_devByteOff = 0;    // gamepad device root, absolute in the global buffer
 static MethodInfo *g_curStatePtr = NULL;
 
-// InputEvent.m_EventId sits right after the 8-byte time field. Zero means "no
-// id"; the Input System treats ids as required, so hand out unique ones.
-static int g_evIdOff = 8;
+// InputEvent.m_EventId sits at the end of the 20-byte native header, after the
+// 8-byte time field. Zero means "no id"; the Input System treats ids as
+// required, so hand out unique ones.
+static int g_evIdOff = 16;
+static int g_evTimeOff = 8;          // InputEvent.time, a double
 static int g_evId = 1;
+// Where InputDevice keeps the timestamp it judges events against. Borrowing it
+// keeps queued events neither stale nor from the future.
+static int g_devTimeOff = 280;
+static void *g_clockDevice = NULL;
 
 // Direct state writes. The queued-event path never reaches device state on
 // device: QueueEvent is accepted without throwing, but the front buffer keeps
@@ -599,46 +627,21 @@ static int stage1(void)
     g_gamepadStateSize = f_class_value_size(g_cGamepadState, &align);
     if (g_gamepadStateSize <= 0 || g_gamepadStateSize > 128) g_gamepadStateSize = 28;
 
-    // InputEvent's type/sizeInBytes/deviceId/time are not fields in the managed
-    // metadata - the whole struct is one field, `m_Event`, of the native type.
-    // Looking them up by name therefore always fails, and the old fallback of
-    // 12/16/18 wrote the FourCC into padding while leaving type at offset 0 as
-    // zero. InputSystem discards an event whose type is 0, so every queued
-    // state event was silently dropped and the pad did nothing. Resolve the
-    // native struct instead and take the offsets from there.
-    Il2CppClass *cNative = f_class_from_name(img, "UnityEngine.InputSystem.LowLevel",
-                                             "NativeInputEvent");
+    // InputEvent's header lives in UnityEngineInternal.Input.NativeInputEvent,
+    // which is Unity's own native event struct and sits in a different assembly
+    // from InputSystem. Looking it up in the InputSystem image always missed,
+    // which is why the offsets fell back to guesses.
+    Il2CppClass *cNative = find_class_any(domain, "UnityEngineInternal.Input",
+                                          "NativeInputEvent");
     if (!cNative)
-        cNative = f_class_from_name(img, "UnityEngine.InputSystem.LowLevel",
-                                    "InputEvent/NativeInputEvent");
-    if (!cNative)
-        cNative = f_class_from_name(img, "UnityEngine.InputSystem.LowLevel",
-                                    "InputEvent$NativeInputEvent");
-    if (!cNative)
-        cNative = f_class_from_name(img, "", "NativeInputEvent");
-
-    // Whatever happens above, print the real type of the one field InputEvent
-    // declares. That name settles which struct actually holds the header.
+        cNative = find_class_any(domain, "UnityEngine.InputSystem.LowLevel",
+                                 "NativeInputEvent");
     fprintf(stderr, TAG "NativeInputEvent lookup: %s\n", cNative ? "found" : "MISSING");
     if (f_class_get_field_from_name && f_field_get_type && f_type_get_name) {
         FieldInfo *fe = f_class_get_field_from_name(g_cInputEvent, "m_Event");
         if (fe) {
             char *tn = f_type_get_name(f_field_get_type(fe));
             fprintf(stderr, TAG "InputEvent.m_Event type = %s\n", tn ? tn : "(null)");
-            Il2CppClass *cInner = NULL;
-            if (tn) {
-                // "Namespace.Name" - split on the last dot for the lookup.
-                char buf[256];
-                snprintf(buf, sizeof buf, "%s", tn);
-                char *dot = strrchr(buf, '.');
-                const char *ns = "";
-                const char *nm = buf;
-                if (dot) { *dot = 0; ns = buf; nm = dot + 1; }
-                cInner = f_class_from_name(img, ns, nm);
-            }
-            if (cInner) dump_fields(cInner, "InputEvent.m_Event struct");
-        } else {
-            fprintf(stderr, TAG "InputEvent.m_Event field not found\n");
         }
     }
     static const char *const nType[] = {"type", "m_Type"};
@@ -666,6 +669,19 @@ static int stage1(void)
         int nextD = (nI >= 0 && nI > nD) ? nI : (nTi >= 0 && nTi > nD ? nTi : 20);
         g_evSizeWidth = nextS - nS;
         g_evDevWidth  = nextD - nD;
+    } else {
+        // Confirmed layout of UnityEngineInternal.Input.NativeInputEvent, read
+        // off the real type name in the device log:
+        //   type @0 (4)  sizeInBytes @4 (ushort)  deviceId @6 (ushort)
+        //   time @8 (double)  eventId @16 (int)   -> 20 bytes
+        // The 20-byte size is what makes stateFormat land at 20 and stateData
+        // at 24, which the metadata already confirmed independently.
+        g_evTypeOff   = 0;
+        g_evSizeOff   = 4;
+        g_evSizeWidth = 2;
+        g_evDeviceOff = 6;
+        g_evDevWidth  = 2;
+        g_evIdOff     = 16;
     }
 
     // eventId must never land on deviceId. This used to sit inside the block
@@ -685,6 +701,17 @@ static int stage1(void)
     int fSd = field_off_any(g_cStateEvent, sdNames, 1);
     if (inner(fSf) >= 0) g_stFormatOff = inner(fSf);
     if (inner(fSd) >= 0) g_payloadOff  = inner(fSd);
+    if (nTi >= 0) g_evTimeOff = nTi;
+
+    // Timestamp source. QueueEvent does not fill in the time, and a calloc'd
+    // buffer leaves it 0 - which InputSystem reads as "before this app started"
+    // and discards. The device's own m_LastUpdateTimeInternal is exactly the
+    // clock InputSystem judges events against, so borrow it instead of guessing
+    // at a time base.
+    static const char *const luNames[] = {"m_LastUpdateTimeInternal", "lastUpdateTimeInternal"};
+    int lu = inner(field_off_any(cDevice, luNames, 2));
+    if (lu >= 0) g_devTimeOff = lu;
+    fprintf(stderr, TAG "clock: device.m_LastUpdateTimeInternal @%d\n", g_devTimeOff);
 
     fprintf(stderr, TAG "resolved device: m_StateBlock@%d(size %d) m_DeviceId@%d\n",
             g_stateBlockOff, g_stateBlockSize, g_deviceIdOff);
@@ -754,6 +781,7 @@ static int stage2(void)
     // subtracts the device root for exactly this reason; the gamepad needs the
     // same treatment or every button lands at byte 672.
     g_devByteOff = byteOffset;
+    g_clockDevice = g_device;
 
     // The event payload is the GamepadState struct. Its declared size is the
     // authority here - the state block's sizeInBits can be narrower than the
@@ -878,6 +906,18 @@ static void gbpad_bump_id(void *buf)
     int id = g_evId++;
     if (g_evId <= 0) g_evId = 1;
     memcpy((unsigned char *)buf + g_evIdOff, &id, 4);
+}
+
+// Stamp the event with the clock InputSystem is currently using. A zero
+// timestamp makes the event look older than the session and it gets dropped
+// before it ever reaches the device state.
+static void gbpad_stamp_time(void *buf)
+{
+    if (!buf || !g_clockDevice || g_devTimeOff < 0) return;
+    double t = 0.0;
+    memcpy(&t, (unsigned char *)g_clockDevice + g_devTimeOff, 8);
+    if (t <= 0.0) return;
+    memcpy((unsigned char *)buf + g_evTimeOff, &t, 8);
 }
 
 // The player loop does not call InputSystem.Update, so drive it at roughly a
@@ -1239,6 +1279,8 @@ static void gbpad_inject_tick(void)
         }
     }
 
+    gbpad_stamp_time(g_evBuffer);
+
     gbpad_bump_id(g_evBuffer);
     void *ptr = g_evBuffer;
     void *args[1] = { &ptr };
@@ -1519,6 +1561,7 @@ static void gbpad_frame(void)
     }
 
     if (g_evBuffer && g_queueMethod) {
+        gbpad_stamp_time(g_evBuffer);
         gbpad_bump_id(g_evBuffer);
         void *ptr = g_evBuffer;
         void *args[1] = { &ptr };
