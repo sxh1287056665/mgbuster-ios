@@ -384,6 +384,14 @@ static int g_buttonsOff = 0;
 static int g_phase = 0;
 static int g_tick = 0;
 
+static MethodInfo *g_evalMagnitude = NULL;
+static MethodInfo *g_sysUpdate = NULL;
+static int g_updateStepOff = -1;
+static uint32_t g_stepFirst = 0;
+static int g_stepCaptured = 0;
+static int g_stepChecked = 0;
+static int g_manualUpdate = 0;
+
 static MethodInfo *g_addMethod = NULL;
 static Il2CppString *g_sLayout = NULL;
 static Il2CppString *g_sName = NULL;
@@ -466,23 +474,32 @@ static int stage1(void)
         return -1;
     }
 
-    // ReadValueAsObject is declared on InputControl, the non-generic base.
-    // Walking up from StickControl failed on device, so ask for the class by
-    // name and read the method straight off it. The chain walk stays as a
-    // fallback in case the class is renamed.
+    // Readback chain. ReadValueAsObject is declared on InputControl, but asking
+    // for it by name returns NULL even though metadata shows 12 method
+    // definitions using that name, so it is not dependable here.
+    // EvaluateMagnitude is the primary path instead: same class, no arguments,
+    // and it returns a plain float, so there is no boxed-layout guesswork.
     if (g_cInputControl) {
+        g_evalMagnitude = f_class_get_method_from_name(g_cInputControl, "EvaluateMagnitude", 0);
         g_readValueAsObject = f_class_get_method_from_name(g_cInputControl, "ReadValueAsObject", 0);
-        if (g_readValueAsObject)
-            fprintf(stderr, TAG "ReadValueAsObject on InputControl\n");
     }
-    if (!g_readValueAsObject && g_cStick)
-        g_readValueAsObject = find_method_up(g_cStick, "ReadValueAsObject", 0, 12);
-    if (!g_readValueAsObject)
-        fprintf(stderr, TAG "WARN ReadValueAsObject unresolved, readback will be skipped\n");
+    if (!g_evalMagnitude && g_cStick)
+        g_evalMagnitude = find_method_up(g_cStick, "EvaluateMagnitude", 0, 12);
+    fprintf(stderr, TAG "readback: EvaluateMagnitude=%s ReadValueAsObject=%s\n",
+            g_evalMagnitude ? "ok" : "MISSING", g_readValueAsObject ? "ok" : "MISSING");
+
+    // Whether the queue is ever drained is a separate question from whether an
+    // event was accepted. InputSystem.Update drives the drain and is hooked in
+    // through the PlayerLoop, which can silently fail under IL2CPP. This step
+    // counter is the cheapest way to find out.
+    g_sysUpdate = f_class_get_method_from_name(g_cSys, "Update", 0);
+    fprintf(stderr, TAG "InputSystem.Update = %p\n", (void *)g_sysUpdate);
 
     uint32_t align = 0;
     g_stateBlockOff = field_off(cDevice, "m_StateBlock");
     g_deviceIdOff   = field_off(cDevice, "m_DeviceId");
+    g_updateStepOff = field_off(cDevice, "m_CurrentUpdateStepCount");
+    fprintf(stderr, TAG "m_CurrentUpdateStepCount @%d\n", g_updateStepOff);
 
     // InputStateBlock exposes auto-properties, so the metadata fields are the
     // compiler-generated backing fields. There is no plain `format`/`sizeInBits`.
@@ -722,6 +739,44 @@ static void gbpad_inject_tick(void)
         return;
     }
 
+    // Before queueing, settle the question of whether the queue is drained at
+    // all. Read the per-device update step counter once, then again a few ticks
+    // later. If it never moves, InputSystem.Update is not running and no amount
+    // of queueing will reach the game.
+    if (g_updateStepOff >= 0 && g_device) {
+        uint32_t step = *(uint32_t *)((unsigned char *)g_device + g_updateStepOff);
+        if (!g_stepCaptured) {
+            g_stepCaptured = 1;
+            g_stepFirst = step;
+            fprintf(stderr, TAG "update step count starts at %u\n", step);
+        } else if (!g_stepChecked && g_tick >= 3) {
+            g_stepChecked = 1;
+            if (step == g_stepFirst) {
+                g_manualUpdate = 1;
+                fprintf(stderr, TAG "update step stuck at %u - InputSystem.Update "
+                        "is NOT running, driving it manually\n", step);
+            } else {
+                fprintf(stderr, TAG "update step advanced %u -> %u, loop is alive\n",
+                        g_stepFirst, step);
+            }
+        }
+    }
+
+    // If the player loop is not driving InputSystem, drive it here. This runs on
+    // the main thread, so there is no contention with a player-loop update - it
+    // simply is not happening. Draining before queueing keeps the front buffer
+    // in step with the back buffer.
+    if (g_manualUpdate && g_sysUpdate) {
+        Il2CppException *ue = NULL;
+        f_runtime_invoke(g_sysUpdate, NULL, NULL, &ue);
+        if (ue) {
+            char msg[256];
+            exc_message(ue, msg, sizeof msg);
+            fprintf(stderr, TAG "manual InputSystem.Update threw: %s\n", msg);
+            g_manualUpdate = 0;
+        }
+    }
+
     void *ptr = g_evBuffer;
     void *args[1] = { &ptr };
     Il2CppException *exc = NULL;
@@ -732,6 +787,14 @@ static void gbpad_inject_tick(void)
         fprintf(stderr, TAG "re-queue threw: %s\n", msg);
         return;
     }
+
+    // Drain again so the state we just queued actually lands in the device
+    // buffer before the next frame reads it.
+    if (g_manualUpdate && g_sysUpdate) {
+        Il2CppException *ue2 = NULL;
+        f_runtime_invoke(g_sysUpdate, NULL, NULL, &ue2);
+    }
+
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{ gbpad_inject_tick(); });
 }
@@ -742,11 +805,10 @@ static void gbpad_readback(void)
 {
     MethodInfo *getCurrent = f_class_get_method_from_name(g_cGamepad, "get_current", 0);
     MethodInfo *getStick = f_class_get_method_from_name(g_cGamepad, "get_leftStick", 0);
-    MethodInfo *readObj = g_readValueAsObject;
 
-    if (!getCurrent || !getStick || !readObj) {
-        fprintf(stderr, TAG "readback unavailable (get_current=%p get_leftStick=%p ReadValueAsObject=%p)\n",
-                (void *)getCurrent, (void *)getStick, (void *)readObj);
+    if (!getCurrent || !getStick || !g_evalMagnitude) {
+        fprintf(stderr, TAG "readback unavailable (get_current=%p get_leftStick=%p EvaluateMagnitude=%p)\n",
+                (void *)getCurrent, (void *)getStick, (void *)g_evalMagnitude);
         return;
     }
 
@@ -762,18 +824,20 @@ static void gbpad_readback(void)
         fprintf(stderr, TAG "readback: leftStick control null\n");
         return;
     }
+
+    // EvaluateMagnitude returns a float. il2cpp boxes it, so the payload sits
+    // right after the two-word object header - no layout guesswork beyond that.
     Il2CppException *e3 = NULL;
-    Il2CppObject *boxed = f_runtime_invoke(readObj, stick, NULL, &e3);
+    Il2CppObject *boxed = f_runtime_invoke(g_evalMagnitude, stick, NULL, &e3);
     if (!boxed || e3) {
         char msg[256];
         exc_message(e3, msg, sizeof msg);
-        fprintf(stderr, TAG "readback: ReadValueAsObject failed: %s\n", msg);
+        fprintf(stderr, TAG "readback: EvaluateMagnitude failed: %s\n", msg);
         return;
     }
-    // Boxed Vector2: il2cpp object header (klass*, monitor) then the value.
-    float *v = (float *)((unsigned char *)boxed + 2 * sizeof(void *));
-    fprintf(stderr, TAG "READBACK leftStick = (%.3f, %.3f)%s\n", v[0], v[1],
-            (v[0] > 0.5f) ? "   <== INJECTION WORKS" : "   <== did not take");
+    float mag = *(float *)((unsigned char *)boxed + 2 * sizeof(void *));
+    fprintf(stderr, TAG "READBACK leftStick magnitude = %.3f%s\n", mag,
+            (mag > 0.3f) ? "   <== INJECTION WORKS" : "   <== did not take");
 }
 
 // --- device creation, on the main thread -----------------------------------
