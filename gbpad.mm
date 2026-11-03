@@ -404,6 +404,13 @@ static uint32_t g_kbDevId = 0;
 static int g_kbByteOff = -1;    // per-key byte offset inside the keyboard state
 static int g_kbBitOff = -1;     // per-key bit within that byte
 static int g_bitOffOff = -1;    // offset of InputStateBlock.bitOffset
+static uint32_t g_kbDevByteOff = 0;  // keyboard device root, absolute in the global buffer
+static MethodInfo *g_curStatePtr = NULL;
+
+// InputEvent.m_EventId sits right after the 8-byte time field. Zero means "no
+// id"; the Input System treats ids as required, so hand out unique ones.
+static int g_evIdOff = 8;
+static int g_evId = 1;
 
 static MethodInfo *g_addMethod = NULL;
 static Il2CppString *g_sLayout = NULL;
@@ -504,8 +511,11 @@ static int stage1(void)
     }
     if (!g_evalMagnitude && g_cStick)
         g_evalMagnitude = find_method_up(g_cStick, "EvaluateMagnitude", 0, 12);
-    fprintf(stderr, TAG "readback: EvaluateMagnitude=%s ReadValueAsObject=%s\n",
-            g_evalMagnitude ? "ok" : "MISSING", g_readValueAsObject ? "ok" : "MISSING");
+    if (g_cInputControl)
+        g_curStatePtr = f_class_get_method_from_name(g_cInputControl, "get_currentStatePtr", 0);
+    fprintf(stderr, TAG "readback: EvaluateMagnitude=%s ReadValueAsObject=%s currentStatePtr=%s\n",
+            g_evalMagnitude ? "ok" : "MISSING", g_readValueAsObject ? "ok" : "MISSING",
+            g_curStatePtr ? "ok" : "MISSING");
 
     // Whether the queue is ever drained is a separate question from whether an
     // event was accepted. InputSystem.Update drives the drain and is hooked in
@@ -712,6 +722,27 @@ static int stage2(void)
 
 // --- measurement -----------------------------------------------------------
 
+static void gbpad_bump_id(void *buf)
+{
+    if (!buf) return;
+    int id = g_evId++;
+    if (g_evId <= 0) g_evId = 1;
+    memcpy((unsigned char *)buf + g_evIdOff, &id, 4);
+}
+
+// The player loop does not call InputSystem.Update, so drive it at roughly a
+// frame rate. 5 Hz (the injection tick rate) is far too coarse: per-frame
+// semantics like WasPressedThisFrame and any per-frame polling would miss a
+// 200 ms press entirely.
+static void gbpad_pump(void)
+{
+    if (!g_manualUpdate || !g_sysUpdate) return;
+    Il2CppException *e = NULL;
+    f_runtime_invoke(g_sysUpdate, NULL, NULL, &e);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{ gbpad_pump(); });
+}
+
 // EvaluateMagnitude returns a plain float, so this needs no layout guesswork.
 // -1 means "could not read", which is different from a real 0.
 static float gbpad_mag(void)
@@ -727,6 +758,25 @@ static float gbpad_mag(void)
     e = NULL;
     Il2CppObject *stick = f_runtime_invoke(getStick, cur, NULL, &e);
     if (!stick || e) return -1.0f;
+
+    // Direct read of the control's live state, bypassing every managed wrapper.
+    // currentStatePtr already points at the control's own slot, so the Vector2
+    // is the first 8 bytes. This is the measurement that cannot be fooled by a
+    // magnitude function behaving unexpectedly.
+    if (g_curStatePtr) {
+        Il2CppException *e4 = NULL;
+        void *sp = (void *)f_runtime_invoke(g_curStatePtr, stick, NULL, &e4);
+        if (sp && !e4 && (uintptr_t)sp > 0x100000000ULL) {
+            float a = 0, b = 0;
+            memcpy(&a, sp, 4);
+            memcpy(&b, (unsigned char *)sp + 4, 4);
+            if (g_manualUpdate)
+                fprintf(stderr, TAG "  raw stick @%p = (%.3f, %.3f)\n", sp, a, b);
+        } else if (g_manualUpdate) {
+            fprintf(stderr, TAG "  raw stick ptr = %p (exc=%p)\n", sp, (void *)e4);
+        }
+    }
+
     e = NULL;
     Il2CppObject *boxed = f_runtime_invoke(g_evalMagnitude, stick, NULL, &e);
     if (!boxed || e) return -1.0f;
@@ -763,10 +813,12 @@ static void gbpad_make_keyboard(void)
     fprintf(stderr, TAG "KEYBOARD CREATED at %p\n", (void *)dev);
 
     unsigned char *d = (unsigned char *)dev;
-    uint32_t fmt = 0, bits = 0;
+    uint32_t fmt = 0, bits = 0, devByteOff = 0;
     memcpy(&fmt,  d + g_stateBlockOff + g_fmtOff, 4);
     memcpy(&bits, d + g_stateBlockOff + g_sizeBitsOff, 4);
+    memcpy(&devByteOff, d + g_stateBlockOff + g_byteOffOff, 4);
     g_kbFormat = fmt;
+    g_kbDevByteOff = devByteOff;
 
     uint32_t stateBytes = bits / 8;
     if (stateBytes == 0 || stateBytes > 64) stateBytes = 14;   // KeyboardState default
@@ -788,8 +840,8 @@ static void gbpad_make_keyboard(void)
     memcpy((unsigned char *)g_kbBuffer + g_evDeviceOff, &id16, 2);
     memcpy((unsigned char *)g_kbBuffer + g_stFormatOff, &fmt, 4);
 
-    fprintf(stderr, TAG "keyboard: id=%u format=0x%08x state=%u bytes total=%u\n",
-            g_kbDevId, g_kbFormat, stateBytes, total);
+    fprintf(stderr, TAG "keyboard: id=%u format=0x%08x byteOffset=%u state=%u bytes total=%u\n",
+            g_kbDevId, g_kbFormat, g_kbDevByteOff, stateBytes, total);
 
     MethodInfo *cur = f_class_get_method_from_name(g_cKeyboard, "get_current", 0);
     if (cur) {
@@ -817,21 +869,36 @@ static int gbpad_kb_set(const char *getterName, int down)
     memcpy(&byteOff, c + g_stateBlockOff + g_byteOffOff, 4);
     memcpy(&bitOff,  c + g_stateBlockOff + g_bitOffOff, 4);
 
+    // byteOffset comes back as an ABSOLUTE position in the global state buffer,
+    // not relative to the device root: on device every key reported 700, which
+    // is exactly the keyboard device's own offset. Subtract the root, then fold
+    // the bit index in - Key values above 7 straddle bytes (X reports bit 38,
+    // i.e. byte 4 bit 6).
     uint32_t stateBytes = g_kbTotal - (uint32_t)g_payloadOff;
-    if (byteOff >= stateBytes || bitOff > 7) {
-        fprintf(stderr, TAG "keyboard: %s out of range (byte=%u bit=%u of %u)\n",
-                getterName, byteOff, bitOff, stateBytes);
+    if (byteOff < g_kbDevByteOff) {
+        fprintf(stderr, TAG "keyboard: %s byte=%u below root %u\n",
+                getterName, byteOff, g_kbDevByteOff);
         return 0;
     }
-    unsigned char *st = (unsigned char *)g_kbBuffer + g_payloadOff + byteOff;
-    if (down) *st |=  (unsigned char)(1u << bitOff);
-    else      *st &= (unsigned char)~(1u << bitOff);
+    uint32_t relBytes = byteOff - g_kbDevByteOff;
+    uint32_t absBit = relBytes * 8u + bitOff;
+    uint32_t bi = absBit / 8u;
+    uint32_t shift = absBit % 8u;
+    if (bi >= stateBytes) {
+        fprintf(stderr, TAG "keyboard: %s out of range (rel=%u bit=%u -> byte %u of %u)\n",
+                getterName, relBytes, bitOff, bi, stateBytes);
+        return 0;
+    }
+    unsigned char *st = (unsigned char *)g_kbBuffer + g_payloadOff + bi;
+    if (down) *st |=  (unsigned char)(1u << shift);
+    else      *st &= (unsigned char)~(1u << shift);
     return 1;
 }
 
 static void gbpad_kb_queue(void)
 {
     if (!g_kbDevice || !g_kbBuffer || !g_queueMethod) return;
+    gbpad_bump_id(g_kbBuffer);
     void *ptr = g_kbBuffer;
     void *args[1] = { &ptr };
     Il2CppException *exc = NULL;
@@ -945,7 +1012,8 @@ static void gbpad_inject_tick(void)
             if (step == g_stepFirst) {
                 g_manualUpdate = 1;
                 fprintf(stderr, TAG "update step stuck at %u - InputSystem.Update "
-                        "is NOT running, driving it manually\n", step);
+                        "is NOT running, pumping it at 60Hz\n", step);
+                dispatch_async(dispatch_get_main_queue(), ^{ gbpad_pump(); });
             } else {
                 fprintf(stderr, TAG "update step advanced %u -> %u, loop is alive\n",
                         g_stepFirst, step);
@@ -968,6 +1036,7 @@ static void gbpad_inject_tick(void)
         }
     }
 
+    gbpad_bump_id(g_evBuffer);
     void *ptr = g_evBuffer;
     void *args[1] = { &ptr };
     Il2CppException *exc = NULL;
