@@ -1669,6 +1669,26 @@ static void gbpad_install_overlay(int attempt)
 // The iOS InputSystem backend is absent from this binary, so nothing hands us a
 // Gamepad. Read GameController ourselves and feed the same virtual device.
 
+// Everything below talks to the controller through the ObjC runtime, so there
+// is no compile-time dependency on GameController headers or the framework.
+static int gb_pressed(id pad, const char *name)
+{
+    if (!pad) return 0;
+    id b = ((id (*)(id, SEL))objc_msgSend)(pad, sel_registerName(name));
+    if (!b) return 0;
+    return ((BOOL (*)(id, SEL))objc_msgSend)(b, sel_registerName("isPressed")) ? 1 : 0;
+}
+
+static float gb_axis(id owner, const char *stickName, const char *axisName)
+{
+    if (!owner) return 0.0f;
+    id s = ((id (*)(id, SEL))objc_msgSend)(owner, sel_registerName(stickName));
+    if (!s) return 0.0f;
+    id a = ((id (*)(id, SEL))objc_msgSend)(s, sel_registerName(axisName));
+    if (!a) return 0.0f;
+    return ((float (*)(id, SEL))objc_msgSend)(a, sel_registerName("value"));
+}
+
 static void gbpad_install_gamecontroller(void)
 {
     // No link-time dependency: pull the framework in on demand. iOS does not
@@ -1688,15 +1708,45 @@ static void gbpad_install_gamecontroller(void)
     }
 
     void (^attach)(id) = ^(id c) {
-        fprintf(stderr, TAG "controller connected\n");
-        SEL selExt = sel_registerName("extendedGamepad");
-        id g = ((id (*)(id, SEL))objc_msgSend)(c, selExt);
+        id g = ((id (*)(id, SEL))objc_msgSend)(c, sel_registerName("extendedGamepad"));
         if (!g) {
-            fprintf(stderr, TAG "  not an extended gamepad, ignored\n");
+            fprintf(stderr, TAG "controller connected but has no extendedGamepad\n");
             return;
         }
-        fprintf(stderr, TAG "  extended gamepad accepted\n");
-        g_gbPadStick = 0;
+
+        // Feed the same virtual device the overlay writes to, so the game only
+        // ever sees one input source.
+        void (^handler)(id, id) = ^(id pad, id element) {
+            (void)element;
+            unsigned m = 0;
+            if (gb_pressed(pad, "buttonA"))     m |= 1u << GB_SOUTH;
+            if (gb_pressed(pad, "buttonB"))     m |= 1u << GB_EAST;
+            if (gb_pressed(pad, "buttonX"))     m |= 1u << GB_WEST;
+            if (gb_pressed(pad, "buttonY"))     m |= 1u << GB_NORTH;
+            if (gb_pressed(pad, "leftShoulder"))  m |= 1u << GB_LB;
+            if (gb_pressed(pad, "rightShoulder")) m |= 1u << GB_RB;
+            if (gb_pressed(pad, "buttonMenu"))  m |= 1u << GB_START;
+            if (gb_pressed(pad, "buttonOptions")) m |= 1u << GB_SELECT;
+            g_gbHeldPad = m;
+
+            float x = gb_axis(pad, "leftThumbstick", "xAxis");
+            float y = gb_axis(pad, "leftThumbstick", "yAxis");
+            float dx = gb_axis(pad, "dpad", "xAxis");
+            float dy = gb_axis(pad, "dpad", "yAxis");
+            if (fabsf(dx) > 0.5f) x = dx;
+            if (fabsf(dy) > 0.5f) y = dy;
+            if (fabsf(x) < 0.14f) x = 0.0f;
+            if (fabsf(y) < 0.14f) y = 0.0f;
+            g_gbStickPad[0] = x;
+            g_gbStickPad[1] = y;
+            g_gbPadStick = (x != 0.0f || y != 0.0f) ? 1 : 0;
+        };
+
+        ((void (*)(id, SEL, id))objc_msgSend)(c, sel_registerName("setHandlerQueue:"),
+                                              dispatch_get_main_queue());
+        ((void (*)(id, SEL, id))objc_msgSend)(g, sel_registerName("setValueChangedHandler:"),
+                                              handler);
+        fprintf(stderr, TAG "extended gamepad attached\n");
     };
 
     NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
@@ -1710,7 +1760,14 @@ static void gbpad_install_gamecontroller(void)
                     g_gbHeldPad = 0;
                     g_gbStickPad[0] = g_gbStickPad[1] = 0.0f;
                     g_gbPadStick = 0;
+                    fprintf(stderr, TAG "controller disconnected\n");
                 }];
+
+    SEL selControllers = sel_registerName("controllers");
+    id existing = ((id (*)(id, SEL))objc_msgSend)((id)gc, selControllers);
+    if (existing) {
+        for (id c in (NSArray *)existing) attach(c);
+    }
 
     SEL selDiscover = sel_registerName(
         "startWirelessControllerDiscoveryWithCompletionHandler:");
