@@ -412,6 +412,15 @@ static MethodInfo *g_curStatePtr = NULL;
 static int g_evIdOff = 8;
 static int g_evId = 1;
 
+// Direct state writes. The queued-event path never reaches device state on
+// device: QueueEvent is accepted without throwing, but the front buffer keeps
+// reading (0,0) no matter how often InputSystem.Update is pumped. currentStatePtr
+// points straight into the live buffer, so writing there skips the whole event
+// pipeline.
+static MethodInfo *g_getLeftStick = NULL;
+static MethodInfo *g_getButtonSouth = NULL;
+static MethodInfo *g_getStartButton = NULL;
+
 static MethodInfo *g_addMethod = NULL;
 static Il2CppString *g_sLayout = NULL;
 static Il2CppString *g_sName = NULL;
@@ -513,9 +522,17 @@ static int stage1(void)
         g_evalMagnitude = find_method_up(g_cStick, "EvaluateMagnitude", 0, 12);
     if (g_cInputControl)
         g_curStatePtr = f_class_get_method_from_name(g_cInputControl, "get_currentStatePtr", 0);
+    if (g_cGamepad) {
+        g_getLeftStick   = f_class_get_method_from_name(g_cGamepad, "get_leftStick", 0);
+        g_getButtonSouth = f_class_get_method_from_name(g_cGamepad, "get_buttonSouth", 0);
+        g_getStartButton = f_class_get_method_from_name(g_cGamepad, "get_startButton", 0);
+    }
     fprintf(stderr, TAG "readback: EvaluateMagnitude=%s ReadValueAsObject=%s currentStatePtr=%s\n",
             g_evalMagnitude ? "ok" : "MISSING", g_readValueAsObject ? "ok" : "MISSING",
             g_curStatePtr ? "ok" : "MISSING");
+    fprintf(stderr, TAG "controls: leftStick=%s buttonSouth=%s start=%s\n",
+            g_getLeftStick ? "ok" : "MISSING", g_getButtonSouth ? "ok" : "MISSING",
+            g_getStartButton ? "ok" : "MISSING");
 
     // Whether the queue is ever drained is a separate question from whether an
     // event was accepted. InputSystem.Update drives the drain and is hooked in
@@ -739,6 +756,13 @@ static void gbpad_pump(void)
     if (!g_manualUpdate || !g_sysUpdate) return;
     Il2CppException *e = NULL;
     f_runtime_invoke(g_sysUpdate, NULL, NULL, &e);
+    if (e) {
+        char msg[256];
+        exc_message(e, msg, sizeof msg);
+        fprintf(stderr, TAG "pump Update threw: %s\n", msg);
+        g_manualUpdate = 0;
+        return;
+    }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{ gbpad_pump(); });
 }
@@ -770,9 +794,8 @@ static float gbpad_mag(void)
             float a = 0, b = 0;
             memcpy(&a, sp, 4);
             memcpy(&b, (unsigned char *)sp + 4, 4);
-            if (g_manualUpdate)
-                fprintf(stderr, TAG "  raw stick @%p = (%.3f, %.3f)\n", sp, a, b);
-        } else if (g_manualUpdate) {
+            fprintf(stderr, TAG "  raw stick @%p = (%.3f, %.3f)\n", sp, a, b);
+        } else {
             fprintf(stderr, TAG "  raw stick ptr = %p (exc=%p)\n", sp, (void *)e4);
         }
     }
@@ -781,6 +804,47 @@ static float gbpad_mag(void)
     Il2CppObject *boxed = f_runtime_invoke(g_evalMagnitude, stick, NULL, &e);
     if (!boxed || e) return -1.0f;
     return *(float *)((unsigned char *)boxed + 2 * sizeof(void *));
+}
+
+// --- direct state writes ---------------------------------------------------
+// The queued-event path is a dead end on device: QueueEvent is accepted without
+// throwing, but the front buffer keeps reading (0,0) however often Update is
+// pumped. currentStatePtr points straight into that live buffer, so writing
+// there bypasses the queue, the manager and the update loop entirely.
+
+static void *ctrl_state(Il2CppObject *dev, MethodInfo *getter)
+{
+    if (!dev || !getter || !g_curStatePtr) return NULL;
+    Il2CppException *e = NULL;
+    Il2CppObject *c = f_runtime_invoke(getter, dev, NULL, &e);
+    if (!c || e) return NULL;
+    e = NULL;
+    void *sp = (void *)f_runtime_invoke(g_curStatePtr, c, NULL, &e);
+    if (!sp || e) return NULL;
+    if ((uintptr_t)sp < 0x100000000ULL) return NULL;
+    return sp;
+}
+
+static void gbpad_direct_apply(void)
+{
+    if (!g_device || !g_curStatePtr) return;
+
+    float sx = g_stickPtr ? g_stickPtr[0] : 0.0f;
+    float sy = g_stickPtr ? g_stickPtr[1] : 0.0f;
+    void *sp = ctrl_state(g_device, g_getLeftStick);
+    if (sp) {
+        memcpy(sp, &sx, 4);
+        memcpy((unsigned char *)sp + 4, &sy, 4);
+    }
+
+    // ButtonControl stores a float, so pressed is 1.0 rather than a bit.
+    uint32_t b = g_buttonsPtr ? *g_buttonsPtr : 0u;
+    float south = (b & 1u)    ? 1.0f : 0.0f;   // GamepadButton.ButtonSouth
+    float start = (b & 4096u) ? 1.0f : 0.0f;   // GamepadButton.Start
+    void *bs = ctrl_state(g_device, g_getButtonSouth);
+    if (bs) memcpy(bs, &south, 4);
+    void *st = ctrl_state(g_device, g_getStartButton);
+    if (st) memcpy(st, &start, 4);
 }
 
 // --- keyboard injection ----------------------------------------------------
@@ -990,8 +1054,14 @@ static void gbpad_inject_tick(void)
         stop = 1;
     }
 
+    // Write the same values straight into the live state buffer. This is the
+    // path that actually has a chance of reaching the game.
+    gbpad_direct_apply();
+
     if (stop) {
         if (g_buttonsPtr) *g_buttonsPtr = 0u;
+        if (g_stickPtr) { g_stickPtr[0] = 0.0f; g_stickPtr[1] = 0.0f; }
+        gbpad_direct_apply();
         g_phase = 6;
         fprintf(stderr, TAG "injection finished\n");
         return;
