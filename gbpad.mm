@@ -463,9 +463,11 @@ static int g_sizeBitsOff = -1;     // InputStateBlock.<sizeInBits>k__BackingFiel
 static int g_leftStickOff = 4;     // GamepadState.leftStick - NOT 0, `buttons` is first
 static int g_gamepadStateSize = 0;
 
-static int g_evTypeOff = 12;       // InputEvent.m_Type
-static int g_evSizeOff = 16;       // InputEvent.m_SizeInBytes
-static int g_evDeviceOff = 18;     // InputEvent.m_DeviceId
+static int g_evTypeOff = 0;        // InputEvent.type      - FourCC, must be non-zero
+static int g_evSizeOff = 4;        // InputEvent.sizeInBytes
+static int g_evDeviceOff = 8;      // InputEvent.deviceId
+static int g_evSizeWidth = 4;      // 4 for uint, 2 for ushort
+static int g_evDevWidth = 4;
 static int g_stFormatOff = 20;     // StateEvent.stateFormat
 static int g_payloadOff = 24;      // StateEvent.stateData - where the state bytes go
 static int g_evTypeFound = 0;
@@ -589,17 +591,44 @@ static int stage1(void)
     g_gamepadStateSize = f_class_value_size(g_cGamepadState, &align);
     if (g_gamepadStateSize <= 0 || g_gamepadStateSize > 128) g_gamepadStateSize = 28;
 
-    // StateEvent exposes stateSizeInBytes/stateOffset as *properties*; only
-    // baseEvent, stateFormat and stateData exist as fields.
-    static const char *const typeNames[] = {"m_Type", "Type"};
-    static const char *const sizeNames[] = {"m_SizeInBytes", "sizeInBytes"};
-    static const char *const devNames[]  = {"m_DeviceId", "deviceId"};
-    int fType = field_off_any(g_cInputEvent, typeNames, 2);
-    int fSize = field_off_any(g_cInputEvent, sizeNames, 2);
-    int fDev  = field_off_any(g_cInputEvent, devNames, 2);
-    if (inner(fType) >= 0) { g_evTypeOff = inner(fType); g_evTypeFound = 1; }
-    if (inner(fSize) >= 0) g_evSizeOff = inner(fSize);
-    if (inner(fDev)  >= 0) g_evDeviceOff = inner(fDev);
+    // InputEvent's type/sizeInBytes/deviceId/time are not fields in the managed
+    // metadata - the whole struct is one field, `m_Event`, of the native type.
+    // Looking them up by name therefore always fails, and the old fallback of
+    // 12/16/18 wrote the FourCC into padding while leaving type at offset 0 as
+    // zero. InputSystem discards an event whose type is 0, so every queued
+    // state event was silently dropped and the pad did nothing. Resolve the
+    // native struct instead and take the offsets from there.
+    Il2CppClass *cNative = f_class_from_name(img, "UnityEngine.InputSystem.LowLevel",
+                                             "NativeInputEvent");
+    if (!cNative)
+        cNative = f_class_from_name(img, "UnityEngine.InputSystem.LowLevel",
+                                    "InputEvent$NativeInputEvent");
+    static const char *const nType[] = {"type", "m_Type"};
+    static const char *const nSize[] = {"sizeInBytes", "m_SizeInBytes"};
+    static const char *const nDev[]  = {"deviceId", "m_DeviceId"};
+    static const char *const nId[]   = {"eventId", "m_EventId"};
+    static const char *const nTime[] = {"time", "m_Time"};
+    int nT = -1, nS = -1, nD = -1, nI = -1, nTi = -1;
+    if (cNative) {
+        nT  = inner(field_off_any(cNative, nType, 2));
+        nS  = inner(field_off_any(cNative, nSize, 2));
+        nD  = inner(field_off_any(cNative, nDev, 2));
+        nI  = inner(field_off_any(cNative, nId, 2));
+        nTi = inner(field_off_any(cNative, nTime, 2));
+        dump_fields(cNative, "NativeInputEvent");
+    }
+    if (nT >= 0 && nS >= 0 && nD >= 0) {
+        g_evTypeOff   = nT;
+        g_evSizeOff   = nS;
+        g_evDeviceOff = nD;
+        g_evTypeFound = 1;
+        // Field widths come from the gap to the next field, so a ushort
+        // sizeInBytes/deviceId pair is not overwritten by a 4-byte store.
+        int nextS = (nD > nS) ? nD : (nI >= 0 ? nI : (nTi >= 0 ? nTi : 20));
+        int nextD = (nI >= 0 && nI > nD) ? nI : (nTi >= 0 && nTi > nD ? nTi : 20);
+        g_evSizeWidth = nextS - nS;
+        g_evDevWidth  = nextD - nD;
+    }
 
     static const char *const sfNames[] = {"stateFormat"};
     static const char *const sdNames[] = {"stateData"};
@@ -614,8 +643,9 @@ static int stage1(void)
             g_fmtOff, g_byteOffOff, g_sizeBitsOff);
     fprintf(stderr, TAG "resolved gamepad: leftStick@%d size=%d\n",
             g_leftStickOff, g_gamepadStateSize);
-    fprintf(stderr, TAG "resolved event : m_Type@%d%s m_SizeInBytes@%d m_DeviceId@%d\n",
-            g_evTypeOff, g_evTypeFound ? "" : " (DEFAULT)", g_evSizeOff, g_evDeviceOff);
+    fprintf(stderr, TAG "resolved event : type@%d%s size@%d(w%d) dev@%d(w%d) id@%d time@%d\n",
+            g_evTypeOff, g_evTypeFound ? "" : " (DEFAULT!)", g_evSizeOff, g_evSizeWidth,
+            g_evDeviceOff, g_evDevWidth, nI, nTi);
     fprintf(stderr, TAG "resolved state : stateFormat@%d payload@%d\n",
             g_stFormatOff, g_payloadOff);
 
@@ -698,13 +728,35 @@ static int stage2(void)
 
     uint32_t total = (uint32_t)(g_payloadOff + stateBytes);
     memcpy(ev + g_evTypeOff, &evType, 4);
-    uint16_t sz16 = (uint16_t)total;
-    memcpy(ev + g_evSizeOff, &sz16, 2);
-    // m_DeviceId is a ushort in InputEvent; writing 4 bytes here would clobber
-    // whatever follows it.
-    uint16_t devId16 = (uint16_t)devId;
-    memcpy(ev + g_evDeviceOff, &devId16, 2);
+    // Widths come from the resolved NativeInputEvent layout: writing 4 bytes
+    // into a 2-byte field would land on top of the field behind it.
+    if (g_evSizeWidth >= 4) {
+        memcpy(ev + g_evSizeOff, &total, 4);
+    } else {
+        uint16_t sz16 = (uint16_t)total;
+        memcpy(ev + g_evSizeOff, &sz16, 2);
+    }
+    if (g_evDevWidth >= 4) {
+        int32_t d32 = (int32_t)devId;
+        memcpy(ev + g_evDeviceOff, &d32, 4);
+    } else {
+        uint16_t d16 = (uint16_t)devId;
+        memcpy(ev + g_evDeviceOff, &d16, 2);
+    }
     memcpy(ev + g_stFormatOff, &fmt, 4);
+
+    // Read the header back: the previous build logged the intended values while
+    // writing them to the wrong place, so the log looked healthy and the event
+    // was dead on arrival.
+    uint32_t rbType = 0, rbSize = 0, rbDev = 0, rbFmt = 0;
+    memcpy(&rbType, ev + g_evTypeOff, 4);
+    memcpy(&rbSize, ev + g_evSizeOff, g_evSizeWidth >= 4 ? 4 : 2);
+    memcpy(&rbDev,  ev + g_evDeviceOff, g_evDevWidth >= 4 ? 4 : 2);
+    memcpy(&rbFmt,  ev + g_stFormatOff, 4);
+    fprintf(stderr, TAG "event hdr: type=0x%08x size=%u dev=%u fmt=0x%08x "
+                        "(at %d/%d/%d/%d)\n",
+            rbType, rbSize, rbDev, rbFmt,
+            g_evTypeOff, g_evSizeOff, g_evDeviceOff, g_stFormatOff);
 
     // Synthetic pattern: leftStick pushed to +X. leftStick sits at +4 inside
     // GamepadState because `buttons` occupies the first 4 bytes.
