@@ -602,7 +602,12 @@ static int stage1(void)
                                              "NativeInputEvent");
     if (!cNative)
         cNative = f_class_from_name(img, "UnityEngine.InputSystem.LowLevel",
+                                    "InputEvent/NativeInputEvent");
+    if (!cNative)
+        cNative = f_class_from_name(img, "UnityEngine.InputSystem.LowLevel",
                                     "InputEvent$NativeInputEvent");
+    if (!cNative)
+        cNative = f_class_from_name(img, "", "NativeInputEvent");
     static const char *const nType[] = {"type", "m_Type"};
     static const char *const nSize[] = {"sizeInBytes", "m_SizeInBytes"};
     static const char *const nDev[]  = {"deviceId", "m_DeviceId"};
