@@ -40,17 +40,50 @@
 // Resolved at load time so it survives ASLR.
 extern "C" uintptr_t g_dnt_resume = 0;
 
-// Replays `stp x28, x27, [sp, #-0x60]!` (the displaced instruction) and branches
-// into the rest of the original function.  Only x9 is touched, so x0..x7 (the
-// incoming arguments) reach the original body intact.
+// The real decoder. Returns (void *)1 once it has filled the caller's buffer,
+// or NULL to mean "this format is not mine, let the original handle it".
+extern "C" __attribute__((used)) void *gbpad_decode(int srcFmt, int dstFmt, int w, int h,
+                                                    const void *src, int srcW, int srcH,
+                                                    void *dst);
+
+// Entry point substituted for DecompressNativeTexture.
 //
-// noreturn is load-bearing: without it the compiler emits `bl`, and the return
-// address it pushes lands underneath the original function's frame, so the
-// original epilogue pops it as part of its own unwind and the stack walks off.
-// With it we get a plain `b`, which is a true tail transfer.
-extern "C" __attribute__((naked, noinline, noreturn)) void gbpad_dnt_continue(void)
+// This has to be naked, and the reason is worth recording. An earlier version
+// was an ordinary function that called a `noreturn` trampoline, on the
+// assumption that clang would emit a tail `b`. It emitted `bl`. The original
+// body then ran with sp 0x150 bytes below where it expects to be, its epilogue
+// `add sp, sp, #0x5e0` popped our return address as if it were a saved
+// register, and the process took a SIGSEGV the first time a texture we cannot
+// decode came through - a 512x720 BC7, before any DXT texture had been touched.
+//
+// Saving and transferring by hand removes the guesswork. On the fallback path
+// sp, x0..x8 and x30 are bit-for-bit what they were on entry, so the original
+// prologue and epilogue pair up exactly as if this function did not exist.
+extern "C" __attribute__((naked, noinline, used, visibility("default")))
+void *gbpad_decompress_native(int srcFmt, int dstFmt, int w, int h,
+                              const void *src, int srcW, int srcH, void *dst)
 {
     __asm__ volatile(
+        "sub  sp, sp, #0x60\n\t"
+        "stp  x0, x1, [sp, #0x00]\n\t"
+        "stp  x2, x3, [sp, #0x10]\n\t"
+        "stp  x4, x5, [sp, #0x20]\n\t"
+        "stp  x6, x7, [sp, #0x30]\n\t"
+        "str  x8, [sp, #0x40]\n\t"
+        "str  x30, [sp, #0x50]\n\t"
+        "bl   _gbpad_decode\n\t"
+        "cbz  x0, 1f\n\t"
+        "ldr  x30, [sp, #0x50]\n\t"
+        "add  sp, sp, #0x60\n\t"
+        "ret\n\t"
+        "1:\n\t"
+        "ldp  x0, x1, [sp, #0x00]\n\t"
+        "ldp  x2, x3, [sp, #0x10]\n\t"
+        "ldp  x4, x5, [sp, #0x20]\n\t"
+        "ldp  x6, x7, [sp, #0x30]\n\t"
+        "ldr  x8, [sp, #0x40]\n\t"
+        "ldr  x30, [sp, #0x50]\n\t"
+        "add  sp, sp, #0x60\n\t"
         "adrp x9, _g_dnt_resume@PAGE\n\t"
         "ldr  x9, [x9, _g_dnt_resume@PAGEOFF]\n\t"
         "stp  x28, x27, [sp, #-0x60]!\n\t"
@@ -542,13 +575,14 @@ static int bc7_image(int w, int h, int srcW, const void *src, void *dst)
 
 // ------------------------------------------------------------------- dispatch
 
-extern "C" __attribute__((visibility("default"), used))
-void *gbpad_decompress_native(int srcFmt, int dstFmt, int w, int h,
-                              const void *src, int srcW, int srcH, void *dst)
+extern "C" __attribute__((used))
+void *gbpad_decode(int srcFmt, int dstFmt, int w, int h,
+                   const void *src, int srcW, int srcH, void *dst)
 {
     (void)srcH;
-    // Anything we cannot reproduce exactly goes back to the original body so
-    // current behaviour is preserved bit for bit.
+    // Anything we cannot reproduce exactly returns NULL, and the naked stub
+    // above hands control back to the original body so current behaviour is
+    // preserved bit for bit.
     if (src && dst && w > 0 && h > 0 && dstFmt == 8) {
         switch (srcFmt) {
         case 96:   // DXT1 sRGB
@@ -571,7 +605,8 @@ void *gbpad_decompress_native(int srcFmt, int dstFmt, int w, int h,
         default:
             break;
         }
-    } else if (srcFmt == 96 || srcFmt == 97 || srcFmt == 100 || srcFmt == 101) {
+    } else if (srcFmt == 96 || srcFmt == 97 || srcFmt == 100 || srcFmt == 101 ||
+               srcFmt == 108 || srcFmt == 109) {
         // We can only fill an RGBA32 buffer. Say so loudly if the engine ever
         // asks for something else, because then this texture stays broken and
         // the reason must be visible in the log rather than guessed at.
@@ -582,10 +617,6 @@ void *gbpad_decompress_native(int srcFmt, int dstFmt, int w, int h,
                     srcFmt, dstFmt, w, h);
         }
     }
-    if (g_dnt_resume)
-        gbpad_dnt_continue();   // tail transfer; does not come back
-    // Only reachable if dladdr failed at load time, in which case there is no
-    // original body to hand off to and failure is the honest answer.
     return NULL;
 }
 
@@ -595,7 +626,7 @@ __attribute__((constructor))
 static void gbpad_texdec_init(void)
 {
     Dl_info di;
-    if (dladdr((void *)&gbpad_decompress_native, &di) && di.dli_fbase) {
+    if (dladdr((void *)&gbpad_decode, &di) && di.dli_fbase) {
         g_dnt_resume = (uintptr_t)di.dli_fbase + 0x29bd50;
         fprintf(stderr, TAG "resume=%p base=%p\n",
                 (void *)g_dnt_resume, di.dli_fbase);
