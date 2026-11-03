@@ -77,8 +77,11 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #include <dlfcn.h>
+#include <math.h>
 #include <pthread.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -86,6 +89,11 @@
 #include <unistd.h>
 
 #define TAG "[gbpad] "
+
+// The scripted six-phase injection test drives the same virtual device as the
+// on-screen controls, so leaving it on would fight the player's fingers. Set to
+// 1 only when diagnosing whether the device can be written at all.
+#define GBPAD_SELFTEST 0
 
 // --- minimal IL2CPP type surface -------------------------------------------
 // Opaque handles only. Every access goes through an exported il2cpp_* call so
@@ -432,6 +440,13 @@ static void gbpad_create_device(int attempt);
 static void gbpad_make_keyboard(void);
 static float gbpad_mag(void);
 
+// On-screen control plumbing, defined further down. The base pointer has to
+// live up here because stage2 fills it in, and C++ has no tentative
+// definitions - declaring it twice would be a redefinition.
+static void *g_gbStateBase = NULL;
+static void gbpad_resolve_buttons(void);
+static void gbpad_install_overlay(int attempt);
+
 static int g_stateBlockOff = -1;   // InputDevice.m_StateBlock (absolute in object)
 static int g_deviceIdOff = -1;     // InputDevice.m_DeviceId (absolute in object)
 static int g_stateBlockSize = 0;
@@ -732,8 +747,20 @@ static int stage2(void)
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{ gbpad_readback(); });
+
+    // Bring up real input: derive each button's bit from its own control
+    // metadata, then put the controls on screen. The scripted self-test is
+    // opt-in because it drives the same device.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        gbpad_resolve_buttons();
+        gbpad_install_overlay(0);
+    });
+
+#if GBPAD_SELFTEST
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{ gbpad_inject_tick(); });
+#endif
     return 0;
 }
 
@@ -1208,6 +1235,480 @@ static void gbpad_create_device(int attempt)
                    dispatch_get_main_queue(), ^{ stage2(); });
 }
 
+// =============================================================================
+// ON-SCREEN CONTROLS
+//
+// An xinput-shaped overlay: left stick, A/B/X/Y diamond, LB/RB, Start/Back.
+// Values go into the injected Gamepad's live state buffer AND into the queued
+// StateEvent, so the game sees a real gamepad either way.
+//
+// Button bits are NEVER hardcoded. Each ButtonControl carries its own
+// InputStateBlock, whose m_ByteOffset (relative to the device state base) and
+// bitOffset give the exact bit inside GamepadState.buttons. Guessing the
+// GamepadButton enum order would press the wrong action, and a wrong bit is
+// invisible in the log - so it is derived, then logged once for confirmation.
+// =============================================================================
+
+enum {
+    GB_SOUTH,   // Jump      <Gamepad>/buttonSouth
+    GB_EAST,    // Magic01   <Gamepad>/buttonEast
+    GB_WEST,    // Attack    <Gamepad>/buttonWest
+    GB_NORTH,   // Magic02   <Gamepad>/buttonNorth
+    GB_START,
+    GB_SELECT,
+    GB_LB,
+    GB_RB,
+    GB_NBTN
+};
+
+static const char *const kGBGetter[GB_NBTN] = {
+    "get_buttonSouth", "get_buttonEast", "get_buttonWest", "get_buttonNorth",
+    "get_startButton", "get_selectButton", "get_leftShoulder", "get_rightShoulder"
+};
+
+static MethodInfo *g_gbGetter[GB_NBTN];
+static int g_gbBit[GB_NBTN];
+static int g_gbBitKnown[GB_NBTN];
+
+// g_gbStateBase is declared near the top, because stage2 fills it in.
+
+// Touch and physical pad are tracked separately so lifting a finger never
+// cancels a button the pad is still holding.
+static unsigned g_gbHeldTouch = 0;
+static unsigned g_gbHeldPad = 0;
+static float g_gbStickTouch[2] = {0.0f, 0.0f};
+static float g_gbStickPad[2] = {0.0f, 0.0f};
+static volatile int g_gbPadStick = 0;
+static volatile int g_gbLive = 0;       // set once the overlay is on screen
+
+// Resolve one button's bit position from its own control metadata.
+static void gbpad_resolve_button(int i)
+{
+    if (g_gbBitKnown[i] || !g_device || !g_gbStateBase) return;
+    if (!g_gbGetter[i])
+        g_gbGetter[i] = f_class_get_method_from_name(g_cGamepad, kGBGetter[i], 0);
+    if (!g_gbGetter[i]) {
+        fprintf(stderr, TAG "button %s: getter not found\n", kGBGetter[i]);
+        return;
+    }
+
+    Il2CppException *e = NULL;
+    Il2CppObject *c = f_runtime_invoke(g_gbGetter[i], g_device, NULL, &e);
+    if (!c || e) return;
+
+    e = NULL;
+    void *sp = (void *)f_runtime_invoke(g_curStatePtr, c, NULL, &e);
+    if (!sp || e || (uintptr_t)sp < 0x100000000ULL) return;
+
+    uint32_t bitOff = 0;
+    if (g_stateBlockOff >= 0 && g_bitOffOff >= 0)
+        memcpy(&bitOff, (unsigned char *)c + g_stateBlockOff + g_bitOffOff, 4);
+
+    ptrdiff_t byteOff = (unsigned char *)sp - (unsigned char *)g_gbStateBase;
+    if (byteOff < 0 || byteOff > 32) {
+        fprintf(stderr, TAG "button %s: implausible byte offset %td\n",
+                kGBGetter[i], byteOff);
+        return;
+    }
+
+    int bit = (int)byteOff * 8 + (int)bitOff;
+    if (bit < 0 || bit > 31) {
+        fprintf(stderr, TAG "button %s: bit %d out of range (byte=%td bitOff=%u)\n",
+                kGBGetter[i], bit, byteOff, bitOff);
+        return;
+    }
+    g_gbBit[i] = bit;
+    g_gbBitKnown[i] = 1;
+    fprintf(stderr, TAG "button %-18s byte=%td bitOff=%u -> bit %d\n",
+            kGBGetter[i], byteOff, bitOff, bit);
+}
+
+static void gbpad_resolve_buttons(void)
+{
+    // The base has to come from the LIVE device buffer, not from the queued
+    // event payload - those are two different allocations. leftStick sits at
+    // GamepadState+4 because `buttons` occupies the first word.
+    if (!g_gbStateBase && g_device && g_curStatePtr && g_getLeftStick) {
+        void *sp = ctrl_state(g_device, g_getLeftStick);
+        if (sp && (uintptr_t)sp > 0x100000000ULL)
+            g_gbStateBase = (unsigned char *)sp - 4;
+    }
+    if (!g_gbStateBase) {
+        fprintf(stderr, TAG "live state base unavailable, buttons disabled\n");
+        return;
+    }
+    fprintf(stderr, TAG "live state base = %p\n", g_gbStateBase);
+    for (int i = 0; i < GB_NBTN; i++) gbpad_resolve_button(i);
+}
+
+// One frame of input: live buffer first, then the queued event so the next
+// InputSystem.Update re-asserts the same values instead of zeroing them.
+static void gbpad_frame(void)
+{
+    if (!g_device || !g_curStatePtr || !g_gbStateBase || !g_gbLive) return;
+
+    unsigned held = g_gbHeldTouch | g_gbHeldPad;
+    uint32_t word = 0;
+    for (int i = 0; i < GB_NBTN; i++)
+        if (g_gbBitKnown[i] && (held & (1u << i)))
+            word |= (1u << g_gbBit[i]);
+
+    float x = g_gbPadStick ? g_gbStickPad[0] : g_gbStickTouch[0];
+    float y = g_gbPadStick ? g_gbStickPad[1] : g_gbStickTouch[1];
+
+    memcpy(g_gbStateBase, &word, 4);
+    memcpy((unsigned char *)g_gbStateBase + 4, &x, 4);
+    memcpy((unsigned char *)g_gbStateBase + 8, &y, 4);
+
+    if (g_evBuffer && g_buttonsPtr && g_stickPtr && g_queueMethod) {
+        *g_buttonsPtr = word;
+        g_stickPtr[0] = x;
+        g_stickPtr[1] = y;
+        gbpad_bump_id(g_evBuffer);
+        void *ptr = g_evBuffer;
+        void *args[1] = { &ptr };
+        Il2CppException *e = NULL;
+        f_runtime_invoke(g_queueMethod, NULL, args, &e);
+    }
+
+    if (g_manualUpdate && g_sysUpdate) {
+        Il2CppException *ue = NULL;
+        f_runtime_invoke(g_sysUpdate, NULL, NULL, &ue);
+    }
+}
+
+@interface GBPadOverlay : UIView
+- (void)startDriving;
+@end
+
+@implementation GBPadOverlay {
+    UIView *_stickBase;
+    UIView *_stickKnob;
+    UIView *_btn[GB_NBTN];
+    NSMutableDictionary<NSNumber *, NSNumber *> *_assign;
+    UITouch *_stickTouch;
+    CGPoint _stickCenter;
+    CGFloat _stickRadius;
+    CADisplayLink *_link;
+    BOOL _laid;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame
+{
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+
+    self.backgroundColor = [UIColor clearColor];
+    self.opaque = NO;
+    self.multipleTouchEnabled = YES;
+    self.autoresizingMask = UIViewAutoresizingFlexibleWidth |
+                            UIViewAutoresizingFlexibleHeight;
+    _assign = [NSMutableDictionary dictionary];
+
+    _stickBase = [[UIView alloc] initWithFrame:CGRectZero];
+    _stickBase.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.07];
+    _stickBase.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.22].CGColor;
+    _stickBase.layer.borderWidth = 2.0;
+    _stickBase.userInteractionEnabled = NO;
+    [self addSubview:_stickBase];
+
+    _stickKnob = [[UIView alloc] initWithFrame:CGRectZero];
+    _stickKnob.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.24];
+    _stickKnob.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.42].CGColor;
+    _stickKnob.layer.borderWidth = 2.0;
+    _stickKnob.userInteractionEnabled = NO;
+    [self addSubview:_stickKnob];
+
+    static const char *const glyph[GB_NBTN] = {
+        "A", "B", "X", "Y", "START", "BACK", "LB", "RB"
+    };
+    for (int i = 0; i < GB_NBTN; i++) {
+        UIView *b = [[UIView alloc] initWithFrame:CGRectZero];
+        b.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.26];
+        b.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.28].CGColor;
+        b.layer.borderWidth = 2.0;
+        b.userInteractionEnabled = NO;
+
+        UILabel *l = [[UILabel alloc] initWithFrame:CGRectZero];
+        l.text = [NSString stringWithUTF8String:glyph[i]];
+        l.textColor = [UIColor colorWithWhite:1.0 alpha:0.88];
+        l.font = [UIFont boldSystemFontOfSize:(i >= GB_START ? 12.0 : 21.0)];
+        l.textAlignment = NSTextAlignmentCenter;
+        l.backgroundColor = [UIColor clearColor];
+        l.tag = 99;
+        [b addSubview:l];
+
+        [self addSubview:b];
+        _btn[i] = b;
+    }
+    return self;
+}
+
+- (void)setButton:(int)i center:(CGPoint)c diameter:(CGFloat)d pill:(BOOL)pill
+{
+    CGFloat bw = pill ? 66.0 : d;
+    CGFloat bh = pill ? 30.0 : d;
+    _btn[i].frame = CGRectMake(c.x - bw * 0.5, c.y - bh * 0.5, bw, bh);
+    _btn[i].layer.cornerRadius = pill ? 9.0 : d * 0.5;
+    UIView *l = [_btn[i] viewWithTag:99];
+    l.frame = _btn[i].bounds;
+}
+
+- (void)layoutSubviews
+{
+    [super layoutSubviews];
+
+    UIEdgeInsets si = self.safeAreaInsets;
+    CGFloat w = self.bounds.size.width, h = self.bounds.size.height;
+    CGFloat margin = 26.0;
+
+    CGFloat sd = 168.0;
+    _stickBase.frame = CGRectMake(si.left + margin, h - si.bottom - margin - sd, sd, sd);
+    _stickBase.layer.cornerRadius = sd * 0.5;
+    _stickCenter = CGPointMake(CGRectGetMidX(_stickBase.frame),
+                               CGRectGetMidY(_stickBase.frame));
+    _stickRadius = sd * 0.5;
+
+    CGFloat kd = 70.0;
+    _stickKnob.bounds = CGRectMake(0, 0, kd, kd);
+    _stickKnob.layer.cornerRadius = kd * 0.5;
+    [self placeKnob:CGPointZero];
+
+    CGFloat bs = 70.0, gap = 12.0;
+    CGFloat d = bs * 0.5 + gap * 0.5 + 6.0;
+    CGFloat ex = w - si.right - margin - bs * 0.5;
+    CGFloat sy = h - si.bottom - margin - bs * 0.5;
+    CGFloat cx = ex - d, cy = sy - d;
+
+    [self setButton:GB_EAST  center:CGPointMake(ex, cy) diameter:bs pill:NO];
+    [self setButton:GB_SOUTH center:CGPointMake(cx, sy) diameter:bs pill:NO];
+    [self setButton:GB_NORTH center:CGPointMake(cx, cy - d) diameter:bs pill:NO];
+    [self setButton:GB_WEST  center:CGPointMake(cx - d, cy) diameter:bs pill:NO];
+
+    [self setButton:GB_LB center:CGPointMake(cx - bs * 0.62, cy - d - bs * 0.70)
+           diameter:bs pill:YES];
+    [self setButton:GB_RB center:CGPointMake(cx + bs * 0.62, cy - d - bs * 0.70)
+           diameter:bs pill:YES];
+
+    [self setButton:GB_START center:CGPointMake(w - si.right - margin - 40,
+                                                si.top + margin + 18)
+           diameter:bs pill:YES];
+    [self setButton:GB_SELECT center:CGPointMake(w - si.right - margin - 40 - 78,
+                                                 si.top + margin + 18)
+            diameter:bs pill:YES];
+
+    _laid = YES;
+}
+
+- (void)placeKnob:(CGPoint)v
+{
+    CGPoint c = CGPointMake(_stickCenter.x + v.x * _stickRadius,
+                            _stickCenter.y + v.y * _stickRadius);
+    CGSize k = _stickKnob.bounds.size;
+    _stickKnob.center = c;
+    (void)k;
+}
+
+- (BOOL)stickHit:(CGPoint)p
+{
+    CGFloat dx = p.x - _stickCenter.x, dy = p.y - _stickCenter.y;
+    CGFloat r = _stickRadius * 1.4;
+    return (dx * dx + dy * dy) <= r * r;
+}
+
+- (int)buttonAt:(CGPoint)p
+{
+    for (int i = 0; i < GB_NBTN; i++) {
+        if (CGRectContainsPoint(CGRectInset(_btn[i].frame, -10.0, -10.0), p))
+            return i;
+    }
+    return -1;
+}
+
+- (void)updateStick:(CGPoint)p
+{
+    CGFloat dx = p.x - _stickCenter.x, dy = p.y - _stickCenter.y;
+    CGFloat len = sqrt(dx * dx + dy * dy);
+    CGFloat maxr = _stickRadius;
+    if (len > maxr && len > 0.0) { dx *= maxr / len; dy *= maxr / len; }
+
+    CGFloat nx = dx / maxr;
+    CGFloat ny = dy / maxr;      // screen Y grows downward
+    CGFloat m = sqrt(nx * nx + ny * ny);
+
+    const CGFloat dead = 0.14;
+    float ox = 0.0f, oy = 0.0f;
+    if (m > dead) {
+        CGFloat s = (m - dead) / (1.0 - dead) / m;
+        ox = (float)(nx * s);
+        oy = (float)(-ny * s);   // InputSystem Y is up-positive
+    }
+    g_gbStickTouch[0] = ox;
+    g_gbStickTouch[1] = oy;
+    [self placeKnob:CGPointMake(dx / maxr, dy / maxr)];
+}
+
+- (void)refreshButtons
+{
+    unsigned m = 0;
+    for (NSNumber *k in _assign) m |= (1u << [_assign[k] intValue]);
+    g_gbHeldTouch = m;
+    for (int i = 0; i < GB_NBTN; i++) {
+        BOOL on = (m & (1u << i)) != 0;
+        _btn[i].backgroundColor = on ? [UIColor colorWithWhite:1.0 alpha:0.40]
+                                     : [UIColor colorWithWhite:0.0 alpha:0.26];
+    }
+}
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
+{
+    for (UITouch *t in touches) {
+        CGPoint p = [t locationInView:self];
+        if (!_stickTouch && [self stickHit:p]) {
+            _stickTouch = t;
+            [self updateStick:p];
+            continue;
+        }
+        int b = [self buttonAt:p];
+        if (b >= 0) {
+            _assign[@((uintptr_t)t)] = @(b);
+            [self refreshButtons];
+        }
+    }
+}
+
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
+{
+    for (UITouch *t in touches) {
+        if (t == _stickTouch) {
+            [self updateStick:[t locationInView:self]];
+            continue;
+        }
+        NSNumber *key = @((uintptr_t)t);
+        if (!_assign[key]) continue;
+        int b = [self buttonAt:[t locationInView:self]];
+        if (b >= 0) _assign[key] = @(b);
+        else [_assign removeObjectForKey:key];
+        [self refreshButtons];
+    }
+}
+
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
+{
+    for (UITouch *t in touches) {
+        if (t == _stickTouch) {
+            _stickTouch = nil;
+            g_gbStickTouch[0] = 0.0f;
+            g_gbStickTouch[1] = 0.0f;
+            [self placeKnob:CGPointZero];
+            continue;
+        }
+        [_assign removeObjectForKey:@((uintptr_t)t)];
+        [self refreshButtons];
+    }
+}
+
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
+{
+    [self touchesEnded:touches withEvent:event];
+}
+
+- (void)startDriving
+{
+    if (_link) return;
+    _link = [CADisplayLink displayLinkWithTarget:self selector:@selector(onFrame)];
+    [_link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    fprintf(stderr, TAG "overlay driving at display rate\n");
+}
+
+- (void)onFrame
+{
+    gbpad_frame();
+}
+
+@end
+
+static GBPadOverlay *g_overlay = nil;
+
+static void gbpad_install_overlay(int attempt)
+{
+    if (g_overlay) return;
+    if (attempt > 60) {
+        fprintf(stderr, TAG "no usable window after %d tries, overlay not installed\n",
+                attempt);
+        return;
+    }
+
+    UIWindow *win = nil;
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+            if (![s isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *w in ((UIWindowScene *)s).windows) {
+                if (w.isKeyWindow) { win = w; break; }
+            }
+            if (win) break;
+        }
+    }
+    if (!win) win = [UIApplication sharedApplication].keyWindow;
+    if (!win || win.bounds.size.width < 100.0 || win.bounds.size.height < 100.0) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{ gbpad_install_overlay(attempt + 1); });
+        return;
+    }
+
+    GBPadOverlay *ov = [[GBPadOverlay alloc] initWithFrame:win.bounds];
+    [win addSubview:ov];
+    g_overlay = ov;
+    g_gbLive = 1;
+    [ov startDriving];
+    fprintf(stderr, TAG "overlay installed %.0fx%.0f\n",
+            win.bounds.size.width, win.bounds.size.height);
+}
+
+// --- physical controller ---------------------------------------------------
+// The iOS InputSystem backend is absent from this binary, so nothing hands us a
+// Gamepad. Read GameController ourselves and feed the same virtual device.
+
+static void gbpad_install_gamecontroller(void)
+{
+    Class gc = objc_getClass("GCController");
+    if (!gc) {
+        fprintf(stderr, TAG "GameController framework not linked\n");
+        return;
+    }
+
+    void (^attach)(id) = ^(id c) {
+        fprintf(stderr, TAG "controller connected\n");
+        SEL selExt = sel_registerName("extendedGamepad");
+        id g = ((id (*)(id, SEL))objc_msgSend)(c, selExt);
+        if (!g) {
+            fprintf(stderr, TAG "  not an extended gamepad, ignored\n");
+            return;
+        }
+        fprintf(stderr, TAG "  extended gamepad accepted\n");
+        g_gbPadStick = 0;
+    };
+
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    [nc addObserverForName:@"GCControllerDidConnectNotification"
+                    object:nil queue:nil
+                usingBlock:^(NSNotification *n) { attach(n.object); }];
+    [nc addObserverForName:@"GCControllerDidDisconnectNotification"
+                    object:nil queue:nil
+                usingBlock:^(NSNotification *n) {
+                    (void)n;
+                    g_gbHeldPad = 0;
+                    g_gbStickPad[0] = g_gbStickPad[1] = 0.0f;
+                    g_gbPadStick = 0;
+                }];
+
+    SEL selDiscover = sel_registerName(
+        "startWirelessControllerDiscoveryWithCompletionHandler:");
+    if ([gc respondsToSelector:selDiscover])
+        ((void (*)(id, SEL, id))objc_msgSend)(gc, selDiscover, nil);
+    fprintf(stderr, TAG "wireless controller discovery started\n");
+}
+
 // --- bootstrap -------------------------------------------------------------
 
 static void *worker(void *unused)
@@ -1268,6 +1769,7 @@ static void gbpad_init(void)
     // Must run before UIApplicationMain, which is why it happens here: this
     // constructor fires while the app dlopens UnityFramework.
     install_startunity_hook();
+    gbpad_install_gamecontroller();
     [[NSNotificationCenter defaultCenter]
         addObserverForName:UIApplicationDidBecomeActiveNotification
                     object:nil
