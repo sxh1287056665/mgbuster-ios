@@ -32,6 +32,8 @@
 #include <stdio.h>
 #include <dlfcn.h>
 
+#include "bc7_tables.h"
+
 #define TAG "[gbpad-tex] "
 
 // Offset inside UnityFramework of the instruction after the one we clobber.
@@ -206,13 +208,336 @@ static void report(int fmt, int w, int h, int srcW, const void *dst)
             fmt, w, h, srcW, sum, lo, hi, distinct, samples);
 }
 
-// ------------------------------------------------------------------ BC7 stub
-// Not wired up yet: returning 0 makes the caller fall through to the original
-// body, so BC7 textures behave exactly as they do today.
+// ------------------------------------------------------------------ BC7 (BPTC)
+// Eight modes, laid out per the BPTC specification. The tables in bc7_tables.h
+// are the spec constants; the bit offsets below were read out of a known-good
+// decoder and then re-verified pixel-exact against it in every mode.
+
+static inline unsigned bc7_dequant_p(unsigned v, unsigned pbit, unsigned vbits)
+{
+    unsigned total = vbits + 1;
+    v = (v << 1) | (pbit & 1u);
+    v <<= (8 - total);
+    v |= (v >> total);
+    return v & 0xffu;
+}
+
+static inline unsigned bc7_dequant(unsigned v, unsigned vbits)
+{
+    v <<= (8 - vbits);
+    v |= (v >> vbits);
+    return v & 0xffu;
+}
+
+static inline unsigned bc7_mix(unsigned l, unsigned h, unsigned wv)
+{
+    return (l * (64u - wv) + h * wv + 32u) >> 6;
+}
+
+static const unsigned char *bc7_wtbl(unsigned bits)
+{
+    return bits == 2 ? g_bc7_w2 : (bits == 3 ? g_bc7_w3 : g_bc7_w4);
+}
+
+// The anchor pixel of each subset stores one bit fewer than the rest. Shifting a
+// zero in at the anchor position lets all sixteen indices be read uniformly.
+static inline void bc7_zero_at(uint64_t &bits, unsigned per, unsigned offset)
+{
+    uint64_t low = ((uint64_t)1 << (per * (offset + 1) - 1)) - 1;
+    bits = ((bits & ~low) << 1) | (bits & low);
+}
+
+static void bc7_block(const unsigned char *b, unsigned char *out)
+{
+    uint64_t lo, hi;
+    memcpy(&lo, b, 8);
+    memcpy(&hi, b + 8, 8);
+
+    unsigned mode = 0;
+    unsigned f = b[0];
+    if (!f) {                     // reserved encoding; nothing sane to produce
+        memset(out, 0, 64);
+        return;
+    }
+    while (!(f & 1u)) { f >>= 1; mode++; }
+
+    if (mode == 0 || mode == 2) {
+        // three subsets, 3- or 2-bit indices
+        const unsigned EP = 6;
+        const unsigned WB = (mode == 0) ? 3u : 2u;
+        const unsigned WB_MASK = (1u << WB) - 1u;
+        const unsigned EP_BITS = (mode == 0) ? 4u : 5u;
+        const unsigned EP_MASK = (1u << EP_BITS) - 1u;
+        const unsigned PBITS = (mode == 0) ? 6u : 0u;
+        const unsigned WVALS = 1u << WB;
+        const unsigned PART_MASK = (mode == 0) ? 0xfu : 0x3fu;
+        const unsigned char *wt = bc7_wtbl(WB);
+
+        unsigned part = (unsigned)((lo >> (mode + 1)) & PART_MASK);
+        uint64_t ch[3];
+        if (mode == 0) {
+            ch[0] = lo >> 5;
+            ch[1] = lo >> 29;
+            ch[2] = (lo >> 53) | (hi << 11);
+        } else {
+            ch[0] = lo >> 9;
+            ch[1] = (lo >> 39) | (hi << 25);
+            ch[2] = hi >> 5;
+        }
+
+        unsigned ep[6][4];
+        memset(ep, 0, sizeof ep);
+        for (unsigned c = 0; c < 3; c++) {
+            uint64_t r = ch[c];
+            for (unsigned e = 0; e < EP; e++) {
+                ep[e][c] = (unsigned)(r & EP_MASK);
+                r >>= EP_BITS;
+            }
+        }
+
+        unsigned pbits[6] = {0, 0, 0, 0, 0, 0};
+        if (mode == 0) {
+            unsigned pb = (unsigned)((hi >> 13) & 0xffu);
+            for (unsigned p = 0; p < PBITS; p++) pbits[p] = (pb >> p) & 1u;
+        }
+
+        uint64_t wr = hi >> (67 - 16 * WB);
+        bc7_zero_at(wr, WB, 0);
+        unsigned a1 = g_bc7_anchor3_1[part], a2 = g_bc7_anchor3_2[part];
+        bc7_zero_at(wr, WB, a1 < a2 ? a1 : a2);
+        bc7_zero_at(wr, WB, a1 < a2 ? a2 : a1);
+
+        unsigned w[16];
+        for (unsigned i = 0; i < 16; i++) { w[i] = (unsigned)(wr & WB_MASK); wr >>= WB; }
+
+        for (unsigned e = 0; e < EP; e++)
+            for (unsigned c = 0; c < 4; c++)
+                ep[e][c] = (c == 3) ? 255u
+                          : (PBITS ? bc7_dequant_p(ep[e][c], pbits[e], EP_BITS)
+                                   : bc7_dequant(ep[e][c], EP_BITS));
+
+        unsigned char bc[3][8][4];
+        for (unsigned s = 0; s < 3; s++)
+            for (unsigned i = 0; i < WVALS; i++) {
+                for (unsigned c = 0; c < 3; c++)
+                    bc[s][i][c] = (unsigned char)bc7_mix(ep[s * 2][c], ep[s * 2 + 1][c], wt[i]);
+                bc[s][i][3] = 255;
+            }
+
+        for (unsigned i = 0; i < 16; i++)
+            memcpy(out + i * 4, bc[g_bc7_partition3[part * 16 + i]][w[i]], 4);
+        return;
+    }
+
+    if (mode == 1 || mode == 3 || mode == 7) {
+        // two subsets; mode 7 also carries alpha
+        const unsigned EP = 4;
+        const unsigned COMPS = (mode == 7) ? 4u : 3u;
+        const unsigned WB = (mode == 1) ? 3u : 2u;
+        const unsigned WB_MASK = (1u << WB) - 1u;
+        const unsigned EP_BITS = (mode == 7) ? 5u : ((mode == 1) ? 6u : 7u);
+        const unsigned EP_MASK = (1u << EP_BITS) - 1u;
+        const unsigned PBITS = (mode == 1) ? 2u : 4u;
+        const int SHARED = (mode == 1);
+        const unsigned WVALS = 1u << WB;
+        const unsigned char *wt = bc7_wtbl(WB);
+
+        unsigned part = (unsigned)((lo >> (mode + 1)) & 0x3fu);
+
+        uint64_t ch[4] = {0, 0, 0, 0};
+        uint64_t pchunk = 0, wr = 0;
+        ch[0] = lo >> (mode + 7);
+        if (mode == 1) {
+            ch[1] = lo >> 32;
+            ch[2] = (lo >> 56) | (hi << 8);
+            pchunk = hi >> 16;
+            wr = hi >> 18;
+        } else if (mode == 3) {
+            ch[1] = (lo >> 38) | (hi << 26);
+            ch[2] = hi >> 2;
+            pchunk = hi >> 30;
+            wr = hi >> 34;
+        } else {
+            ch[1] = lo >> 34;
+            ch[2] = (lo >> 54) | (hi << 10);
+            ch[3] = hi >> 10;
+            pchunk = hi >> 30;
+            wr = hi >> 34;
+        }
+
+        unsigned ep[4][4];
+        memset(ep, 0, sizeof ep);
+        for (unsigned c = 0; c < COMPS; c++) {
+            uint64_t r = ch[c];
+            for (unsigned e = 0; e < EP; e++) {
+                ep[e][c] = (unsigned)(r & EP_MASK);
+                r >>= EP_BITS;
+            }
+        }
+
+        unsigned pbits[4] = {0, 0, 0, 0};
+        for (unsigned p = 0; p < PBITS; p++) pbits[p] = (unsigned)((pchunk >> p) & 1u);
+
+        bc7_zero_at(wr, WB, 0);
+        bc7_zero_at(wr, WB, g_bc7_anchor2[part]);
+
+        unsigned w[16];
+        for (unsigned i = 0; i < 16; i++) { w[i] = (unsigned)(wr & WB_MASK); wr >>= WB; }
+
+        for (unsigned e = 0; e < EP; e++)
+            for (unsigned c = 0; c < 4; c++)
+                ep[e][c] = (mode != 7 && c == 3) ? 255u
+                          : bc7_dequant_p(ep[e][c], pbits[SHARED ? (e >> 1) : e], EP_BITS);
+
+        unsigned char bc[2][8][4];
+        memset(bc, 0, sizeof bc);
+        for (unsigned s = 0; s < 2; s++)
+            for (unsigned i = 0; i < WVALS; i++) {
+                for (unsigned c = 0; c < COMPS; c++)
+                    bc[s][i][c] = (unsigned char)bc7_mix(ep[s * 2][c], ep[s * 2 + 1][c], wt[i]);
+                if (COMPS == 3) bc[s][i][3] = 255;
+            }
+
+        for (unsigned i = 0; i < 16; i++)
+            memcpy(out + i * 4, bc[g_bc7_partition2[part * 16 + i]][w[i]], 4);
+        return;
+    }
+
+    if (mode == 4 || mode == 5) {
+        // single subset, separate colour and alpha index planes
+        const unsigned WB = 2;
+        const unsigned A_WB = (mode == 4) ? 3u : 2u;
+        const unsigned EP_BITS = (mode == 4) ? 5u : 7u;
+        const unsigned EP_MASK = (1u << EP_BITS) - 1u;
+        const unsigned A_EP_BITS = (mode == 4) ? 6u : 8u;
+        const unsigned A_EP_MASK = (1u << A_EP_BITS) - 1u;
+
+        unsigned comp_rot = (unsigned)((lo >> (mode + 1)) & 3u);
+        unsigned index_mode = (mode == 4) ? (unsigned)((lo >> 7) & 1u) : 0u;
+
+        uint64_t crb = lo >> 8;
+        unsigned ep[2][4];
+        memset(ep, 0, sizeof ep);
+        for (unsigned c = 0; c < 3; c++)
+            for (unsigned e = 0; e < 2; e++) {
+                ep[e][c] = (unsigned)(crb & EP_MASK);
+                crb >>= EP_BITS;
+            }
+
+        uint64_t rgbw, aw;
+        if (mode == 4) {
+            ep[0][3] = (unsigned)(crb & A_EP_MASK);
+            ep[1][3] = (unsigned)((crb >> A_EP_BITS) & A_EP_MASK);
+            rgbw = (lo >> 50) | (hi << 14);
+            aw = hi >> 17;
+        } else {
+            ep[0][3] = (unsigned)(crb & A_EP_MASK);
+            ep[1][3] = (unsigned)(((lo >> 58) | (hi << 6)) & A_EP_MASK);
+            rgbw = hi >> 2;
+            aw = hi >> 33;
+        }
+
+        bc7_zero_at(rgbw, WB, 0);
+        bc7_zero_at(aw, A_WB, 0);
+
+        unsigned wbits[2], wmask[2];
+        wbits[0] = index_mode ? A_WB : WB;
+        wbits[1] = index_mode ? WB : A_WB;
+        wmask[0] = (1u << wbits[0]) - 1u;
+        wmask[1] = (1u << wbits[1]) - 1u;
+
+        if (index_mode) { uint64_t t = rgbw; rgbw = aw; aw = t; }
+
+        unsigned w[16], awi[16];
+        for (unsigned i = 0; i < 16; i++) { w[i] = (unsigned)(rgbw & wmask[0]); rgbw >>= wbits[0]; }
+        for (unsigned i = 0; i < 16; i++) { awi[i] = (unsigned)(aw & wmask[1]); aw >>= wbits[1]; }
+
+        for (unsigned e = 0; e < 2; e++)
+            for (unsigned c = 0; c < 4; c++)
+                ep[e][c] = bc7_dequant(ep[e][c], (c == 3) ? A_EP_BITS : EP_BITS);
+
+        const unsigned char *cwt = bc7_wtbl(wbits[0]);
+        const unsigned char *awt = bc7_wtbl(wbits[1]);
+        unsigned char bc[16][4];
+        memset(bc, 0, sizeof bc);
+        for (unsigned i = 0; i < (1u << wbits[0]); i++)
+            for (unsigned c = 0; c < 3; c++)
+                bc[i][c] = (unsigned char)bc7_mix(ep[0][c], ep[1][c], cwt[i]);
+        for (unsigned i = 0; i < (1u << wbits[1]); i++)
+            bc[i][3] = (unsigned char)bc7_mix(ep[0][3], ep[1][3], awt[i]);
+
+        for (unsigned i = 0; i < 16; i++) {
+            memcpy(out + i * 4, bc[w[i]], 4);
+            out[i * 4 + 3] = bc[awi[i]][3];
+            if (comp_rot >= 1) {
+                unsigned char t = out[i * 4 + 3];
+                out[i * 4 + 3] = out[i * 4 + (comp_rot - 1)];
+                out[i * 4 + (comp_rot - 1)] = t;
+            }
+        }
+        return;
+    }
+
+    if (mode == 6) {
+        // single subset, 7-bit RGBA endpoints, 4-bit indices
+        unsigned r0 = (unsigned)((lo >> 7) & 0x7fu);
+        unsigned r1 = (unsigned)((lo >> 14) & 0x7fu);
+        unsigned g0 = (unsigned)((lo >> 21) & 0x7fu);
+        unsigned g1 = (unsigned)((lo >> 28) & 0x7fu);
+        unsigned b0 = (unsigned)((lo >> 35) & 0x7fu);
+        unsigned b1 = (unsigned)((lo >> 42) & 0x7fu);
+        unsigned a0 = (unsigned)((lo >> 49) & 0x7fu);
+        unsigned a1 = (unsigned)((lo >> 56) & 0x7fu);
+        unsigned p0 = (unsigned)((lo >> 63) & 1u);
+        unsigned p1 = (unsigned)(hi & 1u);
+
+        unsigned char v[16][4];
+        for (unsigned i = 0; i < 16; i++) {
+            unsigned wv = g_bc7_w4[i];
+            v[i][0] = (unsigned char)bc7_mix((r0 << 1) | p0, (r1 << 1) | p1, wv);
+            v[i][1] = (unsigned char)bc7_mix((g0 << 1) | p0, (g1 << 1) | p1, wv);
+            v[i][2] = (unsigned char)bc7_mix((b0 << 1) | p0, (b1 << 1) | p1, wv);
+            v[i][3] = (unsigned char)bc7_mix((a0 << 1) | p0, (a1 << 1) | p1, wv);
+        }
+
+        // pixel 0 is the anchor and stores 3 bits; the rest store 4
+        unsigned idx0 = (unsigned)((hi >> 1) & 0x7u);
+        memcpy(out, v[idx0], 4);
+        for (unsigned i = 1; i < 16; i++) {
+            unsigned idx = (unsigned)((hi >> (4 + (i - 1) * 4)) & 0xfu);
+            memcpy(out + i * 4, v[idx], 4);
+        }
+        return;
+    }
+
+    memset(out, 0, 64);           // reserved mode
+}
+
 static int bc7_image(int w, int h, int srcW, const void *src, void *dst)
 {
-    (void)w; (void)h; (void)srcW; (void)src; (void)dst;
-    return 0;
+    const unsigned char *s = (const unsigned char *)src;
+    unsigned char *d = (unsigned char *)dst;
+    int pitch = w * 4;
+    int bw = (srcW + 3) / 4;
+    int bh = (h + 3) / 4;
+    unsigned char blk[64];
+
+    for (int by = 0; by < bh; by++) {
+        int py = by * 4;
+        if (py >= h) break;
+        for (int bx = 0; bx < bw; bx++) {
+            int cx = bx * 4;
+            if (cx >= w) continue;
+            bc7_block(s + ((size_t)by * bw + bx) * 16, blk);
+            unsigned char *o = d + (size_t)py * pitch + (size_t)cx * 4;
+            int cols = (w - cx) < 4 ? (w - cx) : 4;
+            for (int y = 0; y < 4; y++) {
+                if (py + y >= h) break;
+                memcpy(o + y * pitch, blk + y * 16, (size_t)cols * 4);
+            }
+        }
+    }
+    return 1;
 }
 
 // ------------------------------------------------------------------- dispatch
