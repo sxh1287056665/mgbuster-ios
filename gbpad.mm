@@ -628,6 +628,16 @@ static int stage1(void)
         int nextD = (nI >= 0 && nI > nD) ? nI : (nTi >= 0 && nTi > nD ? nTi : 20);
         g_evSizeWidth = nextS - nS;
         g_evDevWidth  = nextD - nD;
+
+        // eventId must not land on deviceId. The old constant was 8, which is
+        // exactly where deviceId lives, so bumping the id each frame rewrote
+        // the device the event was addressed to and it went nowhere.
+        if (nI >= 0)
+            g_evIdOff = nI;
+        else if (nD == 6)
+            g_evIdOff = 16;         // type@0 size@4u16 dev@6u16 time@8 id@16
+        else
+            g_evIdOff = nD + 4;     // type@0 size@4 dev@8 id@12 time@16
     }
 
     static const char *const sfNames[] = {"stateFormat"};
@@ -645,7 +655,7 @@ static int stage1(void)
             g_leftStickOff, g_gamepadStateSize);
     fprintf(stderr, TAG "resolved event : type@%d%s size@%d(w%d) dev@%d(w%d) id@%d time@%d\n",
             g_evTypeOff, g_evTypeFound ? "" : " (DEFAULT!)", g_evSizeOff, g_evSizeWidth,
-            g_evDeviceOff, g_evDevWidth, nI, nTi);
+            g_evDeviceOff, g_evDevWidth, g_evIdOff, nTi);
     fprintf(stderr, TAG "resolved state : stateFormat@%d payload@%d\n",
             g_stFormatOff, g_payloadOff);
 
