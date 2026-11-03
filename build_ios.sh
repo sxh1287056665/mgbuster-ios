@@ -112,9 +112,19 @@ log "   libUnityGeneratedStubs.a $(du -h "$STUB/libUnityGeneratedStubs.a" | cut 
 xcrun --sdk iphoneos clang++ -arch arm64 -mios-version-min=11.0 -O2 -std=c++17 \
     -fobjc-arc -c "$ROOT/gbpad.mm" -o "$STUB/gbpad.o" \
     || { log "gbpad compile failed"; exit 1; }
-xcrun --sdk iphoneos libtool -static -o "$STUB/libgbpad.a" "$STUB/gbpad.o" \
+# 3d. texture decompressor
+# The iOS player was linked with only the ETC2/EAC and ASTC decoders, so every
+# DXT1/DXT5/BC7 texture in these PC asset bundles hits DecompressNativeTexture's
+# "unsupported format" branch and renders blank. gbpad_texdec.cpp supplies those
+# three formats; patch_texdec.py (step 6b) rewrites the dispatcher's entry into a
+# branch to it. Both live in the same image, so no new segment is needed.
+xcrun --sdk iphoneos clang++ -arch arm64 -mios-version-min=11.0 -O2 -std=c++17 \
+    -c "$ROOT/gbpad_texdec.cpp" -o "$STUB/gbpad_texdec.o" \
+    || { log "gbpad_texdec compile failed"; exit 1; }
+xcrun --sdk iphoneos libtool -static -o "$STUB/libgbpad.a" \
+    "$STUB/gbpad.o" "$STUB/gbpad_texdec.o" \
     || { log "gbpad archive failed"; exit 1; }
-log "   libgbpad.a              $(du -h "$STUB/libgbpad.a" | cut -f1)  (virtual gamepad)"
+log "   libgbpad.a              $(du -h "$STUB/libgbpad.a" | cut -f1)  (virtual gamepad + DXT/BC7)"
 
 log ""
 log "== 4. repackage GameAssembly.dylib as a framework =="
@@ -295,6 +305,22 @@ python3 "$ROOT/patch_nullmanager.py" \
 pc=${PIPESTATUS[0]}
 if [ "$pc" -ne 0 ]; then
     log "patch step failed (exit $pc)"
+    exit 1
+fi
+
+# The iOS player carries only ETC2/EAC and ASTC decompressors. Its format
+# dispatcher switches on GraphicsFormat over 0x6f..0x96, so DXT1 (97), DXT5 (101)
+# and BC7 (109) -- everything these PC bundles actually contain -- fall outside
+# the jump table and land on the branch that logs "Failed to decompress".
+# gbpad_texdec.cpp is already linked into this same image, so rewriting the
+# dispatcher's first instruction into a PC-relative branch is enough.
+log ""
+log "--- patch texture decompressor ---"
+python3 "$ROOT/patch_texdec.py" \
+    "$APP/Frameworks/UnityFramework.framework/UnityFramework" 2>&1 | tee -a "$LOG"
+tc=${PIPESTATUS[0]}
+if [ "$tc" -ne 0 ]; then
+    log "texture patch step failed (exit $tc)"
     exit 1
 fi
 
