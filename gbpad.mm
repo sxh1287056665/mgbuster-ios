@@ -124,6 +124,11 @@ static size_t (*f_field_get_offset)(FieldInfo *);
 static const char *(*f_field_get_name)(FieldInfo *);
 static FieldInfo *(*f_class_get_field_from_name)(Il2CppClass *, const char *);
 static void (*f_field_get_value)(Il2CppObject *, FieldInfo *, void *);
+// Used only for diagnostics: InputEvent hides its header inside a native
+// struct, so printing that struct's real name and fields is the only way to
+// stop guessing at the layout.
+static void *(*f_field_get_type)(FieldInfo *);
+static char *(*f_type_get_name)(const void *);
 static int32_t (*f_class_value_size)(Il2CppClass *, uint32_t *);
 static Il2CppClass *(*f_class_get_parent)(Il2CppClass *);
 static const char *(*f_class_get_name)(Il2CppClass *);
@@ -160,6 +165,8 @@ static int bind_api(void)
     BIND(field_get_name);
     BIND(class_get_field_from_name);
     BIND(field_get_value);
+BIND(field_get_type);
+BIND(type_get_name);
     BIND(class_value_size);
     BIND(class_get_parent);
     BIND(class_get_name);
@@ -413,6 +420,7 @@ static int g_kbByteOff = -1;    // per-key byte offset inside the keyboard state
 static int g_kbBitOff = -1;     // per-key bit within that byte
 static int g_bitOffOff = -1;    // offset of InputStateBlock.bitOffset
 static uint32_t g_kbDevByteOff = 0;  // keyboard device root, absolute in the global buffer
+static uint32_t g_devByteOff = 0;    // gamepad device root, absolute in the global buffer
 static MethodInfo *g_curStatePtr = NULL;
 
 // InputEvent.m_EventId sits right after the 8-byte time field. Zero means "no
@@ -608,6 +616,31 @@ static int stage1(void)
                                     "InputEvent$NativeInputEvent");
     if (!cNative)
         cNative = f_class_from_name(img, "", "NativeInputEvent");
+
+    // Whatever happens above, print the real type of the one field InputEvent
+    // declares. That name settles which struct actually holds the header.
+    fprintf(stderr, TAG "NativeInputEvent lookup: %s\n", cNative ? "found" : "MISSING");
+    if (f_class_get_field_from_name && f_field_get_type && f_type_get_name) {
+        FieldInfo *fe = f_class_get_field_from_name(g_cInputEvent, "m_Event");
+        if (fe) {
+            char *tn = f_type_get_name(f_field_get_type(fe));
+            fprintf(stderr, TAG "InputEvent.m_Event type = %s\n", tn ? tn : "(null)");
+            Il2CppClass *cInner = NULL;
+            if (tn) {
+                // "Namespace.Name" - split on the last dot for the lookup.
+                char buf[256];
+                snprintf(buf, sizeof buf, "%s", tn);
+                char *dot = strrchr(buf, '.');
+                const char *ns = "";
+                const char *nm = buf;
+                if (dot) { *dot = 0; ns = buf; nm = dot + 1; }
+                cInner = f_class_from_name(img, ns, nm);
+            }
+            if (cInner) dump_fields(cInner, "InputEvent.m_Event struct");
+        } else {
+            fprintf(stderr, TAG "InputEvent.m_Event field not found\n");
+        }
+    }
     static const char *const nType[] = {"type", "m_Type"};
     static const char *const nSize[] = {"sizeInBytes", "m_SizeInBytes"};
     static const char *const nDev[]  = {"deviceId", "m_DeviceId"};
@@ -633,17 +666,18 @@ static int stage1(void)
         int nextD = (nI >= 0 && nI > nD) ? nI : (nTi >= 0 && nTi > nD ? nTi : 20);
         g_evSizeWidth = nextS - nS;
         g_evDevWidth  = nextD - nD;
-
-        // eventId must not land on deviceId. The old constant was 8, which is
-        // exactly where deviceId lives, so bumping the id each frame rewrote
-        // the device the event was addressed to and it went nowhere.
-        if (nI >= 0)
-            g_evIdOff = nI;
-        else if (nD == 6)
-            g_evIdOff = 16;         // type@0 size@4u16 dev@6u16 time@8 id@16
-        else
-            g_evIdOff = nD + 4;     // type@0 size@4 dev@8 id@12 time@16
     }
+
+    // eventId must never land on deviceId. This used to sit inside the block
+    // above, so when the native lookup failed the id stayed at 8 - the same
+    // offset as deviceId - and bumping it each frame rewrote the device the
+    // event was addressed to. Decide it unconditionally.
+    if (nI >= 0)
+        g_evIdOff = nI;
+    else if (g_evDeviceOff == 6)
+        g_evIdOff = 16;             // type@0 size@4u16 dev@6u16 time@8 id@16
+    else
+        g_evIdOff = g_evDeviceOff + 4;  // type@0 size@4 dev@8 id@12 time@16
 
     static const char *const sfNames[] = {"stateFormat"};
     static const char *const sdNames[] = {"stateData"};
@@ -715,6 +749,11 @@ static int stage2(void)
 
     fprintf(stderr, TAG "device: id=%d format=0x%08x byteOffset=%u sizeInBits=%u\n",
             devId, fmt, byteOffset, sizeInBits);
+    // A control's InputStateBlock.m_ByteOffset is absolute inside the global
+    // state buffers, not relative to the device. The keyboard path already
+    // subtracts the device root for exactly this reason; the gamepad needs the
+    // same treatment or every button lands at byte 672.
+    g_devByteOff = byteOffset;
 
     // The event payload is the GamepadState struct. Its declared size is the
     // authority here - the state block's sizeInBits can be narrower than the
@@ -1379,20 +1418,35 @@ static void gbpad_resolve_button(int i)
     memcpy(&byteOff, (unsigned char *)c + g_stateBlockOff + g_byteOffOff, 4);
     memcpy(&bitOff,  (unsigned char *)c + g_stateBlockOff + g_bitOffOff, 4);
 
-    if (byteOff > 64 || bitOff > 31) {
-        fprintf(stderr, TAG "button %s: implausible offset (byte=%u bit=%u)\n",
-                kGBGetter[i], byteOff, bitOff);
+    if (bitOff > 31) {
+        fprintf(stderr, TAG "button %s: implausible bit offset %u\n",
+                kGBGetter[i], bitOff);
+        return;
+    }
+
+    // m_ByteOffset is absolute in the global state buffers. The device root is
+    // what currentStatePtr hands back, so subtract it to get the offset inside
+    // the device's own state. Without this every button reported byte 672.
+    if (byteOff < g_devByteOff) {
+        fprintf(stderr, TAG "button %s: byte %u is below device root %u\n",
+                kGBGetter[i], byteOff, g_devByteOff);
+        return;
+    }
+    uint32_t rel = byteOff - g_devByteOff;
+    if (rel > 64) {
+        fprintf(stderr, TAG "button %s: implausible relative offset %u\n",
+                kGBGetter[i], rel);
         return;
     }
 
     // bitOff is counted from the start of the buttons field, so a bit past the
     // first byte belongs to the next one. Observed values run 4..13, i.e. the
     // low half of a 16-bit field, which spans two bytes.
-    g_gbByte[i] = (int)(byteOff + bitOff / 8);
+    g_gbByte[i] = (int)(rel + bitOff / 8);
     g_gbBit[i]  = (int)(bitOff % 8);
     g_gbBitKnown[i] = 1;
-    fprintf(stderr, TAG "button %-18s state[%d] bit %d  (byte=%u bit=%u)\n",
-            kGBGetter[i], g_gbByte[i], g_gbBit[i], byteOff, bitOff);
+    fprintf(stderr, TAG "button %-18s state[%d] bit %d  (abs=%u root=%u rel=%u bit=%u)\n",
+            kGBGetter[i], g_gbByte[i], g_gbBit[i], byteOff, g_devByteOff, rel, bitOff);
 }
 
 static void gbpad_resolve_buttons(void)
@@ -1417,7 +1471,8 @@ static void gbpad_resolve_buttons(void)
         if (c && !e) {
             uint32_t bo = 0;
             memcpy(&bo, (unsigned char *)c + g_stateBlockOff + g_byteOffOff, 4);
-            if (bo <= 64) g_gbStickByte = (int)bo;
+            if (bo >= g_devByteOff && (bo - g_devByteOff) <= 64)
+                g_gbStickByte = (int)(bo - g_devByteOff);
         }
     }
     if (g_gbStickByte < 0) g_gbStickByte = 4;
