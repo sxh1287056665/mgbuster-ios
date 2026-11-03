@@ -1267,8 +1267,19 @@ static const char *const kGBGetter[GB_NBTN] = {
 };
 
 static MethodInfo *g_gbGetter[GB_NBTN];
-static int g_gbBit[GB_NBTN];
+// Where each button lives inside the device state buffer.
+//
+// `currentStatePtr` turned out to return the same pointer for every control on
+// this binary - it is the device's state base, not a per-control slot. Pointer
+// subtraction therefore yields a constant 4 for all eight buttons and puts every
+// bit at index 36..45, which is why the first device run logged "bit 38 out of
+// range" for all of them. The only trustworthy source for a control's position
+// is its own InputStateBlock, whose m_ByteOffset is already absolute in that
+// buffer, so the offsets are read from there and nowhere else.
+static int g_gbByte[GB_NBTN];           // absolute byte inside the state buffer
+static int g_gbBit[GB_NBTN];            // bit index within that byte
 static int g_gbBitKnown[GB_NBTN];
+static int g_gbStickByte = -1;          // absolute byte of leftStick
 
 // g_gbStateBase is declared near the top, because stage2 fills it in.
 
@@ -1281,7 +1292,7 @@ static float g_gbStickPad[2] = {0.0f, 0.0f};
 static volatile int g_gbPadStick = 0;
 static volatile int g_gbLive = 0;       // set once the overlay is on screen
 
-// Resolve one button's bit position from its own control metadata.
+// Resolve one button's position from its own control metadata.
 static void gbpad_resolve_button(int i)
 {
     if (g_gbBitKnown[i] || !g_device || !g_gbStateBase) return;
@@ -1291,53 +1302,61 @@ static void gbpad_resolve_button(int i)
         fprintf(stderr, TAG "button %s: getter not found\n", kGBGetter[i]);
         return;
     }
+    if (g_stateBlockOff < 0 || g_byteOffOff < 0 || g_bitOffOff < 0) return;
 
     Il2CppException *e = NULL;
     Il2CppObject *c = f_runtime_invoke(g_gbGetter[i], g_device, NULL, &e);
     if (!c || e) return;
 
-    e = NULL;
-    void *sp = (void *)f_runtime_invoke(g_curStatePtr, c, NULL, &e);
-    if (!sp || e || (uintptr_t)sp < 0x100000000ULL) return;
+    uint32_t byteOff = 0, bitOff = 0;
+    memcpy(&byteOff, (unsigned char *)c + g_stateBlockOff + g_byteOffOff, 4);
+    memcpy(&bitOff,  (unsigned char *)c + g_stateBlockOff + g_bitOffOff, 4);
 
-    uint32_t bitOff = 0;
-    if (g_stateBlockOff >= 0 && g_bitOffOff >= 0)
-        memcpy(&bitOff, (unsigned char *)c + g_stateBlockOff + g_bitOffOff, 4);
-
-    ptrdiff_t byteOff = (unsigned char *)sp - (unsigned char *)g_gbStateBase;
-    if (byteOff < 0 || byteOff > 32) {
-        fprintf(stderr, TAG "button %s: implausible byte offset %td\n",
-                kGBGetter[i], byteOff);
+    if (byteOff > 64 || bitOff > 31) {
+        fprintf(stderr, TAG "button %s: implausible offset (byte=%u bit=%u)\n",
+                kGBGetter[i], byteOff, bitOff);
         return;
     }
 
-    int bit = (int)byteOff * 8 + (int)bitOff;
-    if (bit < 0 || bit > 31) {
-        fprintf(stderr, TAG "button %s: bit %d out of range (byte=%td bitOff=%u)\n",
-                kGBGetter[i], bit, byteOff, bitOff);
-        return;
-    }
-    g_gbBit[i] = bit;
+    // bitOff is counted from the start of the buttons field, so a bit past the
+    // first byte belongs to the next one. Observed values run 4..13, i.e. the
+    // low half of a 16-bit field, which spans two bytes.
+    g_gbByte[i] = (int)(byteOff + bitOff / 8);
+    g_gbBit[i]  = (int)(bitOff % 8);
     g_gbBitKnown[i] = 1;
-    fprintf(stderr, TAG "button %-18s byte=%td bitOff=%u -> bit %d\n",
-            kGBGetter[i], byteOff, bitOff, bit);
+    fprintf(stderr, TAG "button %-18s state[%d] bit %d  (byte=%u bit=%u)\n",
+            kGBGetter[i], g_gbByte[i], g_gbBit[i], byteOff, bitOff);
 }
 
 static void gbpad_resolve_buttons(void)
 {
     // The base has to come from the LIVE device buffer, not from the queued
-    // event payload - those are two different allocations. leftStick sits at
-    // GamepadState+4 because `buttons` occupies the first word.
+    // event payload - those are two different allocations. Every control
+    // reports this same address, so it is the device base and needs no
+    // adjustment.
     if (!g_gbStateBase && g_device && g_curStatePtr && g_getLeftStick) {
         void *sp = ctrl_state(g_device, g_getLeftStick);
         if (sp && (uintptr_t)sp > 0x100000000ULL)
-            g_gbStateBase = (unsigned char *)sp - 4;
+            g_gbStateBase = sp;
     }
     if (!g_gbStateBase) {
         fprintf(stderr, TAG "live state base unavailable, buttons disabled\n");
         return;
     }
-    fprintf(stderr, TAG "live state base = %p\n", g_gbStateBase);
+
+    if (g_gbStickByte < 0 && g_stateBlockOff >= 0 && g_byteOffOff >= 0) {
+        Il2CppException *e = NULL;
+        Il2CppObject *c = f_runtime_invoke(g_getLeftStick, g_device, NULL, &e);
+        if (c && !e) {
+            uint32_t bo = 0;
+            memcpy(&bo, (unsigned char *)c + g_stateBlockOff + g_byteOffOff, 4);
+            if (bo <= 64) g_gbStickByte = (int)bo;
+        }
+    }
+    if (g_gbStickByte < 0) g_gbStickByte = 4;
+
+    fprintf(stderr, TAG "live state base = %p  stick@%d\n",
+            g_gbStateBase, g_gbStickByte);
     for (int i = 0; i < GB_NBTN; i++) gbpad_resolve_button(i);
 }
 
@@ -1348,22 +1367,36 @@ static void gbpad_frame(void)
     if (!g_device || !g_curStatePtr || !g_gbStateBase || !g_gbLive) return;
 
     unsigned held = g_gbHeldTouch | g_gbHeldPad;
-    uint32_t word = 0;
-    for (int i = 0; i < GB_NBTN; i++)
-        if (g_gbBitKnown[i] && (held & (1u << i)))
-            word |= (1u << g_gbBit[i]);
-
     float x = g_gbPadStick ? g_gbStickPad[0] : g_gbStickTouch[0];
     float y = g_gbPadStick ? g_gbStickPad[1] : g_gbStickTouch[1];
 
-    memcpy(g_gbStateBase, &word, 4);
-    memcpy((unsigned char *)g_gbStateBase + 4, &x, 4);
-    memcpy((unsigned char *)g_gbStateBase + 8, &y, 4);
+    unsigned char *live = (unsigned char *)g_gbStateBase;
+    unsigned char *evp = (g_evBuffer && g_payloadOff >= 0)
+                       ? (unsigned char *)g_evBuffer + g_payloadOff : NULL;
 
-    if (g_evBuffer && g_buttonsPtr && g_stickPtr && g_queueMethod) {
-        *g_buttonsPtr = word;
-        g_stickPtr[0] = x;
-        g_stickPtr[1] = y;
+    // Touch only the bits we own. Clearing the whole word would stomp the dpad
+    // and the triggers, which we do not drive and which the device may be
+    // reporting on its own.
+    for (int i = 0; i < GB_NBTN; i++) {
+        if (!g_gbBitKnown[i]) continue;
+        unsigned char mask = (unsigned char)(1u << g_gbBit[i]);
+        int on = (held & (1u << i)) ? 1 : 0;
+        unsigned char *p = live + g_gbByte[i];
+        if (on) *p |= mask; else *p &= (unsigned char)~mask;
+        if (evp) {
+            unsigned char *q = evp + g_gbByte[i];
+            if (on) *q |= mask; else *q &= (unsigned char)~mask;
+        }
+    }
+
+    memcpy(live + g_gbStickByte, &x, 4);
+    memcpy(live + g_gbStickByte + 4, &y, 4);
+    if (evp) {
+        memcpy(evp + g_gbStickByte, &x, 4);
+        memcpy(evp + g_gbStickByte + 4, &y, 4);
+    }
+
+    if (g_evBuffer && g_queueMethod) {
         gbpad_bump_id(g_evBuffer);
         void *ptr = g_evBuffer;
         void *args[1] = { &ptr };
