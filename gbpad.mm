@@ -1650,7 +1650,7 @@ static void gbpad_frame(void)
 - (void)startDriving;
 @end
 
-static NSString *const kGBLayoutKey = @"gbpad.layout.v1";
+static NSString *const kGBLayoutKey = @"gbpad.layout.v2";
 
 @implementation GBPadOverlay {
     UIView *_stickBase;
@@ -1667,17 +1667,23 @@ static NSString *const kGBLayoutKey = @"gbpad.layout.v1";
     // rotation or a different device without any rescaling pass.
     CGPoint _pos[GB_NBTN];
     CGPoint _stickPos;
+    CGFloat _scale[GB_NBTN];       // per-control size multiplier
     CGFloat _stickScale;
+    BOOL _hidden[GB_NBTN];         // removed by the user; kept restorable
+    BOOL _stickHidden;
 
     BOOL _edit;
     UITouch *_dragTouch;
     int _dragIdx;              // -2 = stick, -1 = none, else button index
     CGPoint _dragOffset;
+    UIButton *_badge[GB_NBTN]; // x / + delete-restore toggle
+    UIButton *_stickBadge;
+    UIPinchGestureRecognizer *_pinch;
+    int _pinchIdx;             // control being resized, -1 none
+    CGFloat _pinchStart;
     UILabel *_hint;
     UIButton *_reset;
 }
-
-
 
 // Defaults were taken off the working hard-coded layout and only normalised,
 // so the first launch looks exactly like the version that already played.
@@ -1701,32 +1707,60 @@ static NSString *const kGBLayoutKey = @"gbpad.layout.v1";
         [GB_LSTICK] = {0.115f, 0.935f},
         [GB_RSTICK] = {0.881f, 0.955f},
     };
-    for (int i = 0; i < GB_NBTN; i++)
+    for (int i = 0; i < GB_NBTN; i++) {
         _pos[i] = CGPointMake(dflt[i][0], dflt[i][1]);
+        _scale[i] = 1.0f;
+        _hidden[i] = NO;
+    }
     _stickPos = CGPointMake(0.115f, 0.750f);
     _stickScale = 1.0f;
+    _stickHidden = NO;
 }
 
 - (void)loadLayout
 {
     [self defaultLayout];
     NSArray *a = [[NSUserDefaults standardUserDefaults] arrayForKey:kGBLayoutKey];
-    if (a.count != GB_NBTN * 2 + 1) return;
-    for (int i = 0; i < GB_NBTN; i++)
-        _pos[i] = CGPointMake([a[i * 2] floatValue], [a[i * 2 + 1] floatValue]);
-    _stickPos = CGPointMake([a[GB_NBTN * 2] floatValue], [a[GB_NBTN * 2 + 1] floatValue]);
+    if (a.count != GB_NBTN * 4 + 4) return;
+    for (int i = 0; i < GB_NBTN; i++) {
+        _pos[i]    = CGPointMake([a[i * 4] floatValue], [a[i * 4 + 1] floatValue]);
+        _scale[i]  = [a[i * 4 + 2] floatValue];
+        _hidden[i] = [a[i * 4 + 3] boolValue];
+        if (_scale[i] < 0.3f || _scale[i] > 3.5f) _scale[i] = 1.0f;
+    }
+    _stickPos    = CGPointMake([a[GB_NBTN * 4] floatValue], [a[GB_NBTN * 4 + 1] floatValue]);
+    _stickScale  = [a[GB_NBTN * 4 + 2] floatValue];
+    _stickHidden = [a[GB_NBTN * 4 + 3] boolValue];
+    if (_stickScale < 0.3f || _stickScale > 3.5f) _stickScale = 1.0f;
 }
 
 - (void)saveLayout
 {
-    NSMutableArray *a = [NSMutableArray arrayWithCapacity:GB_NBTN * 2 + 1];
+    NSMutableArray *a = [NSMutableArray arrayWithCapacity:GB_NBTN * 4 + 4];
     for (int i = 0; i < GB_NBTN; i++) {
         [a addObject:@(_pos[i].x)];
         [a addObject:@(_pos[i].y)];
+        [a addObject:@(_scale[i])];
+        [a addObject:@(_hidden[i])];
     }
     [a addObject:@(_stickPos.x)];
     [a addObject:@(_stickPos.y)];
+    [a addObject:@(_stickScale)];
+    [a addObject:@(_stickHidden)];
     [[NSUserDefaults standardUserDefaults] setObject:a forKey:kGBLayoutKey];
+}
+
+- (UIButton *)makeBadge
+{
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.titleLabel.font = [UIFont boldSystemFontOfSize:15.0];
+    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    b.backgroundColor = [UIColor colorWithRed:0.85 green:0.20 blue:0.20 alpha:0.95];
+    b.layer.cornerRadius = 13.0;
+    b.layer.borderWidth = 1.5;
+    b.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.75].CGColor;
+    b.tag = -1;
+    return b;
 }
 
 - (instancetype)initWithFrame:(CGRect)frame
@@ -1741,6 +1775,7 @@ static NSString *const kGBLayoutKey = @"gbpad.layout.v1";
                             UIViewAutoresizingFlexibleHeight;
     _assign = [NSMutableDictionary dictionary];
     _dragIdx = -1;
+    _pinchIdx = -1;
     [self loadLayout];
 
     _stickBase = [[UIView alloc] initWithFrame:CGRectZero];
@@ -1781,25 +1816,47 @@ static NSString *const kGBLayoutKey = @"gbpad.layout.v1";
 
         [self addSubview:b];
         _btn[i] = b;
+
+        _badge[i] = [self makeBadge];
+        _badge[i].tag = i;
+        [_badge[i] addTarget:self action:@selector(onBadge:)
+            forControlEvents:UIControlEventTouchUpInside];
+        _badge[i].hidden = YES;
+        [self addSubview:_badge[i]];
     }
+
+    _stickBadge = [self makeBadge];
+    _stickBadge.tag = -2;
+    [_stickBadge addTarget:self action:@selector(onBadge:)
+         forControlEvents:UIControlEventTouchUpInside];
+    _stickBadge.hidden = YES;
+    [self addSubview:_stickBadge];
 
     UILongPressGestureRecognizer *lp =
         [[UILongPressGestureRecognizer alloc] initWithTarget:self
                                                       action:@selector(onLongPress:)];
-    lp.minimumPressDuration = 0.55;
+    lp.minimumPressDuration = 3.0;
     lp.cancelsTouchesInView = NO;
     [self addGestureRecognizer:lp];
 
+    _pinch = [[UIPinchGestureRecognizer alloc] initWithTarget:self
+                                                       action:@selector(onPinch:)];
+    _pinch.cancelsTouchesInView = YES;
+    _pinch.delegate = (id)self;
+    [self addGestureRecognizer:_pinch];
+
     _hint = [[UILabel alloc] initWithFrame:CGRectZero];
-    _hint.text = @"拖动控件调整位置";
+    _hint.text = @"拖动移动 · 双指缩放 · × 删除";
     _hint.textColor = [UIColor colorWithWhite:1.0 alpha:0.85];
-    _hint.font = [UIFont boldSystemFontOfSize:13.0];
+    _hint.font = [UIFont boldSystemFontOfSize:12.0];
     _hint.textAlignment = NSTextAlignmentCenter;
     _hint.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.55];
     _hint.layer.cornerRadius = 8.0;
     _hint.clipsToBounds = YES;
     _hint.hidden = YES;
     _hint.userInteractionEnabled = NO;
+    _hint.adjustsFontSizeToFitWidth = YES;
+    _hint.minimumScaleFactor = 0.7;
     [self addSubview:_hint];
 
     _reset = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -1821,8 +1878,17 @@ static NSString *const kGBLayoutKey = @"gbpad.layout.v1";
     if (i == GB_DUP || i == GB_DDOWN || i == GB_DLEFT || i == GB_DRIGHT) s = 56.0;
     else if (i == GB_LT || i == GB_RT || i == GB_LSTICK || i == GB_RSTICK) s = 56.0;
     else if (i == GB_START || i == GB_SELECT || i == GB_LB || i == GB_RB) s = 0.0;
-    _btn[i].bounds = CGRectMake(0, 0, s > 0.0 ? s : 66.0, s > 0.0 ? s : 30.0);
-    _btn[i].layer.cornerRadius = s > 0.0 ? s * 0.5 : 9.0;
+
+    CGFloat k = _scale[i];
+    if (s > 0.0) {
+        CGFloat d = s * k;
+        _btn[i].bounds = CGRectMake(0, 0, d, d);
+        _btn[i].layer.cornerRadius = d * 0.5;
+    } else {
+        CGFloat bw = 66.0 * k, bh = 30.0 * k;
+        _btn[i].bounds = CGRectMake(0, 0, bw, bh);
+        _btn[i].layer.cornerRadius = 9.0 * k;
+    }
     UIView *l = [_btn[i] viewWithTag:99];
     l.frame = _btn[i].bounds;
 }
@@ -1833,28 +1899,51 @@ static NSString *const kGBLayoutKey = @"gbpad.layout.v1";
 
     UIEdgeInsets si = self.safeAreaInsets;
     CGFloat w = self.bounds.size.width, h = self.bounds.size.height;
-    CGFloat sd = 168.0;
+    CGFloat uw = w - si.left - si.right, uh = h - si.top - si.bottom;
 
     for (int i = 0; i < GB_NBTN; i++) {
         [self sizeFor:i];
-        _btn[i].center = CGPointMake(si.left + _pos[i].x * (w - si.left - si.right),
-                                     si.top + _pos[i].y * (h - si.top - si.bottom));
+        _btn[i].center = CGPointMake(si.left + _pos[i].x * uw,
+                                     si.top + _pos[i].y * uh);
+        _btn[i].alpha = _hidden[i] ? 0.22 : 1.0;
+
+        CGPoint c = _btn[i].center;
+        CGSize bs = _btn[i].bounds.size;
+        _badge[i].frame = CGRectMake(c.x + bs.width * 0.5 - 20.0,
+                                     c.y - bs.height * 0.5 - 6.0, 26.0, 26.0);
+        [_badge[i] setTitle:(_hidden[i] ? @"+" : @"\xC3\x97") forState:UIControlStateNormal];
+        _badge[i].backgroundColor = _hidden[i]
+            ? [UIColor colorWithRed:0.20 green:0.62 blue:0.28 alpha:0.95]
+            : [UIColor colorWithRed:0.85 green:0.20 blue:0.20 alpha:0.95];
+        _badge[i].hidden = !_edit;
     }
 
+    CGFloat sd = 168.0 * _stickScale;
     _stickBase.bounds = CGRectMake(0, 0, sd, sd);
     _stickBase.layer.cornerRadius = sd * 0.5;
-    _stickBase.center = CGPointMake(si.left + _stickPos.x * (w - si.left - si.right),
-                                    si.top + _stickPos.y * (h - si.top - si.bottom));
+    _stickBase.center = CGPointMake(si.left + _stickPos.x * uw,
+                                    si.top + _stickPos.y * uh);
+    _stickBase.alpha = _stickHidden ? 0.22 : 1.0;
     _stickCenter = _stickBase.center;
     _stickRadius = sd * 0.5;
 
-    CGFloat kd = 70.0;
+    CGFloat kd = 70.0 * _stickScale;
     _stickKnob.bounds = CGRectMake(0, 0, kd, kd);
     _stickKnob.layer.cornerRadius = kd * 0.5;
+    _stickKnob.alpha = _stickHidden ? 0.0 : 1.0;
     [self placeKnob:CGPointZero];
 
-    _hint.frame = CGRectMake(w * 0.5 - 80, si.top + 6, 160, 28);
-    _reset.frame = CGRectMake(w * 0.5 + 86, si.top + 6, 56, 28);
+    _stickBadge.frame = CGRectMake(_stickCenter.x + sd * 0.5 - 20.0,
+                                   _stickCenter.y - sd * 0.5 - 6.0, 26.0, 26.0);
+    [_stickBadge setTitle:(_stickHidden ? @"+" : @"\xC3\x97")
+                 forState:UIControlStateNormal];
+    _stickBadge.backgroundColor = _stickHidden
+        ? [UIColor colorWithRed:0.20 green:0.62 blue:0.28 alpha:0.95]
+        : [UIColor colorWithRed:0.85 green:0.20 blue:0.20 alpha:0.95];
+    _stickBadge.hidden = !_edit;
+
+    _hint.frame = CGRectMake(w * 0.5 - 105, si.top + 6, 210, 28);
+    _reset.frame = CGRectMake(w * 0.5 + 112, si.top + 6, 56, 28);
 
     _laid = YES;
 }
@@ -1867,6 +1956,7 @@ static NSString *const kGBLayoutKey = @"gbpad.layout.v1";
 
 - (BOOL)stickHit:(CGPoint)p
 {
+    if (_stickHidden) return NO;
     CGFloat dx = p.x - _stickCenter.x, dy = p.y - _stickCenter.y;
     CGFloat r = _stickRadius * 1.4;
     return (dx * dx + dy * dy) <= r * r;
@@ -1875,10 +1965,36 @@ static NSString *const kGBLayoutKey = @"gbpad.layout.v1";
 - (int)buttonAt:(CGPoint)p
 {
     for (int i = 0; i < GB_NBTN; i++) {
+        if (_hidden[i]) continue;
         if (CGRectContainsPoint(CGRectInset(_btn[i].frame, -10.0, -10.0), p))
             return i;
     }
     return -1;
+}
+
+- (void)onBadge:(UIButton *)b
+{
+    if (b.tag == -2) {
+        _stickHidden = !_stickHidden;
+        if (_stickHidden) {
+            g_gbStickTouch[0] = 0.0f;
+            g_gbStickTouch[1] = 0.0f;
+            _stickTouch = nil;
+        }
+    } else if (b.tag >= 0) {
+        _hidden[b.tag] = !_hidden[b.tag];
+        if (_hidden[b.tag]) {
+            // Drop any finger still holding the control that just vanished.
+            NSNumber *gone = @(b.tag);
+            if (_assign[gone] == nil) {
+                for (NSNumber *k in [_assign allKeys])
+                    if ([_assign[k] isEqual:gone]) [_assign removeObjectForKey:k];
+                [self refreshButtons];
+            }
+        }
+    }
+    [self saveLayout];
+    [self setNeedsLayout];
 }
 
 - (void)onLongPress:(UILongPressGestureRecognizer *)g
@@ -1891,11 +2007,17 @@ static NSString *const kGBLayoutKey = @"gbpad.layout.v1";
         _btn[i].layer.borderColor = (_edit
             ? [UIColor colorWithRed:1.0 green:0.85 blue:0.3 alpha:0.95]
             : [UIColor colorWithWhite:1.0 alpha:0.28]).CGColor;
+    _stickBase.layer.borderColor = (_edit
+        ? [UIColor colorWithRed:1.0 green:0.85 blue:0.3 alpha:0.95]
+        : [UIColor colorWithWhite:1.0 alpha:0.22]).CGColor;
     // Lifting every finger when entering edit mode avoids a half-held button
     // sticking once the same touch starts moving a control instead.
     [_assign removeAllObjects];
     g_gbHeldTouch = 0;
-    if (_edit) [self saveLayout];
+    g_gbStickTouch[0] = 0.0f;
+    g_gbStickTouch[1] = 0.0f;
+    _stickTouch = nil;
+    [self setNeedsLayout];
 }
 
 - (void)onReset
@@ -1903,6 +2025,47 @@ static NSString *const kGBLayoutKey = @"gbpad.layout.v1";
     [self defaultLayout];
     [self saveLayout];
     [self setNeedsLayout];
+}
+
+- (void)onPinch:(UIPinchGestureRecognizer *)g
+{
+    if (!_edit) return;
+    CGPoint p = [g locationInView:self];
+
+    if (g.state == UIGestureRecognizerStateBegan) {
+        _pinchIdx = -1;
+        if ([self stickHit:p]) {
+            _pinchIdx = -2;
+        } else {
+            for (int i = 0; i < GB_NBTN; i++) {
+                if (_hidden[i]) continue;
+                if (CGRectContainsPoint(CGRectInset(_btn[i].frame, -14.0, -14.0), p)) {
+                    _pinchIdx = i;
+                    break;
+                }
+            }
+        }
+        if (_pinchIdx == -2) _pinchStart = _stickScale;
+        else if (_pinchIdx >= 0) _pinchStart = _scale[_pinchIdx];
+        else return;
+        _dragTouch = nil;
+        _dragIdx = -1;
+    }
+
+    if (_pinchIdx == -1) return;
+
+    CGFloat v = _pinchStart * g.scale;
+    if (v < 0.55f) v = 0.55f;
+    if (v > 2.6f) v = 2.6f;
+    if (_pinchIdx == -2) _stickScale = v;
+    else if (_pinchIdx >= 0) _scale[_pinchIdx] = v;
+    [self setNeedsLayout];
+
+    if (g.state == UIGestureRecognizerStateEnded ||
+        g.state == UIGestureRecognizerStateCancelled) {
+        [self saveLayout];
+        _pinchIdx = -1;
+    }
 }
 
 - (void)updateStick:(CGPoint)p
@@ -1934,6 +2097,7 @@ static NSString *const kGBLayoutKey = @"gbpad.layout.v1";
     for (NSNumber *k in _assign) m |= (1u << [_assign[k] intValue]);
     g_gbHeldTouch = m;
     for (int i = 0; i < GB_NBTN; i++) {
+        if (_hidden[i]) { _btn[i].backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.10]; continue; }
         BOOL on = (m & (1u << i)) != 0;
         _btn[i].backgroundColor = on ? [UIColor colorWithWhite:1.0 alpha:0.40]
                                      : [UIColor colorWithWhite:0.0 alpha:0.26];
@@ -1950,12 +2114,12 @@ static NSString *const kGBLayoutKey = @"gbpad.layout.v1";
         CGPoint p = [t locationInView:self];
 
         if (_edit) {
-            if (_dragTouch) continue;
-            if ([self stickHit:p]) {
+            if (_dragTouch || _pinch.state == UIGestureRecognizerStateBegan) continue;
+            if (!_stickHidden && [self stickHit:p]) {
                 _dragTouch = t;
                 _dragIdx = -2;
-                _dragOffset = CGPointMake(_stickPos.x * uw + si.left - p.x,
-                                          _stickPos.y * uh + si.top - p.y);
+                _dragOffset = CGPointMake(si.left + _stickPos.x * uw - p.x,
+                                          si.top + _stickPos.y * uh - p.y);
                 continue;
             }
             int b = [self buttonAt:p];
