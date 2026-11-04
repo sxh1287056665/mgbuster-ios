@@ -1650,6 +1650,7 @@ static void gbpad_frame(void)
 - (void)startDriving;
 @end
 
+
 static NSString *const kGBLayoutKey = @"gbpad.layout.v2";
 
 @implementation GBPadOverlay {
@@ -1678,9 +1679,13 @@ static NSString *const kGBLayoutKey = @"gbpad.layout.v2";
     CGPoint _dragOffset;
     UIButton *_badge[GB_NBTN]; // x / + delete-restore toggle
     UIButton *_stickBadge;
-    UIPinchGestureRecognizer *_pinch;
+    // Two-finger resize is tracked from the raw touch list instead of a
+    // UIPinchGestureRecognizer: the recogniser sets cancelsTouchesInView and
+    // swallows touchesEnded during fast multi-finger play, which left buttons
+    // stuck down. Reading allTouches ourselves cannot interfere with presses.
     int _pinchIdx;             // control being resized, -1 none
     CGFloat _pinchStart;
+    CGFloat _pinchDist0;
     UILabel *_hint;
     UIButton *_reset;
 }
@@ -1838,12 +1843,6 @@ static NSString *const kGBLayoutKey = @"gbpad.layout.v2";
     lp.minimumPressDuration = 3.0;
     lp.cancelsTouchesInView = NO;
     [self addGestureRecognizer:lp];
-
-    _pinch = [[UIPinchGestureRecognizer alloc] initWithTarget:self
-                                                       action:@selector(onPinch:)];
-    _pinch.cancelsTouchesInView = YES;
-    _pinch.delegate = (id)self;
-    [self addGestureRecognizer:_pinch];
 
     _hint = [[UILabel alloc] initWithFrame:CGRectZero];
     _hint.text = @"拖动移动 · 双指缩放 · × 删除";
@@ -2027,47 +2026,6 @@ static NSString *const kGBLayoutKey = @"gbpad.layout.v2";
     [self setNeedsLayout];
 }
 
-- (void)onPinch:(UIPinchGestureRecognizer *)g
-{
-    if (!_edit) return;
-    CGPoint p = [g locationInView:self];
-
-    if (g.state == UIGestureRecognizerStateBegan) {
-        _pinchIdx = -1;
-        if ([self stickHit:p]) {
-            _pinchIdx = -2;
-        } else {
-            for (int i = 0; i < GB_NBTN; i++) {
-                if (_hidden[i]) continue;
-                if (CGRectContainsPoint(CGRectInset(_btn[i].frame, -14.0, -14.0), p)) {
-                    _pinchIdx = i;
-                    break;
-                }
-            }
-        }
-        if (_pinchIdx == -2) _pinchStart = _stickScale;
-        else if (_pinchIdx >= 0) _pinchStart = _scale[_pinchIdx];
-        else return;
-        _dragTouch = nil;
-        _dragIdx = -1;
-    }
-
-    if (_pinchIdx == -1) return;
-
-    CGFloat v = _pinchStart * g.scale;
-    if (v < 0.55f) v = 0.55f;
-    if (v > 2.6f) v = 2.6f;
-    if (_pinchIdx == -2) _stickScale = v;
-    else if (_pinchIdx >= 0) _scale[_pinchIdx] = v;
-    [self setNeedsLayout];
-
-    if (g.state == UIGestureRecognizerStateEnded ||
-        g.state == UIGestureRecognizerStateCancelled) {
-        [self saveLayout];
-        _pinchIdx = -1;
-    }
-}
-
 - (void)updateStick:(CGPoint)p
 {
     CGFloat dx = p.x - _stickCenter.x, dy = p.y - _stickCenter.y;
@@ -2104,23 +2062,111 @@ static NSString *const kGBLayoutKey = @"gbpad.layout.v2";
     }
 }
 
+// Rebuild the whole held set from the event's own touch list instead of
+// patching a dictionary on every began/ended. UIKit coalesces and cancels
+// touch events under fast multi-finger input, and a single missed `ended`
+// leaves an entry in the map forever - that is what makes buttons stick.
+// `allTouches` is authoritative: a finger that lifted is simply not in it.
+- (void)rebuildFrom:(UIEvent *)event
+{
+    [_assign removeAllObjects];
+    UITouch *stick = nil;
+
+    for (UITouch *t in event.allTouches) {
+        UITouchPhase ph = t.phase;
+        if (ph == UITouchPhaseEnded || ph == UITouchPhaseCancelled) continue;
+        if ([t.view isKindOfClass:[UIButton class]]) continue;
+
+        CGPoint p = [t locationInView:self];
+        int b = [self buttonAt:p];
+        if (b >= 0) {
+            _assign[@((uintptr_t)t)] = @(b);
+            continue;
+        }
+        if (!_edit && !stick && [self stickHit:p]) stick = t;
+    }
+
+    _stickTouch = stick;
+    if (stick) {
+        [self updateStick:[stick locationInView:self]];
+    } else {
+        g_gbStickTouch[0] = 0.0f;
+        g_gbStickTouch[1] = 0.0f;
+        [self placeKnob:CGPointZero];
+    }
+    [self refreshButtons];
+}
+
+// Two-finger resize, driven from the touch list rather than a recogniser so it
+// cannot cancel presses. Returns YES when it consumed the event.
+- (BOOL)handlePinchFrom:(UIEvent *)event phase:(UITouchPhase)phase
+{
+    if (!_edit) return NO;
+    NSMutableArray *pts = [NSMutableArray array];
+    for (UITouch *t in event.allTouches) {
+        if (t.phase == UITouchPhaseEnded || t.phase == UITouchPhaseCancelled) continue;
+        [pts addObject:t];
+    }
+    if (pts.count < 2) {
+        if (phase == UITouchPhaseBegan && _pinchIdx != -1) {
+            // one finger lifted; keep the size reached so far
+            [self saveLayout];
+            _pinchIdx = -1;
+        }
+        return _pinchIdx != -1;
+    }
+
+    UITouch *a = pts[0], *b = pts[1];
+    CGPoint pa = [a locationInView:self], pb = [b locationInView:self];
+    CGFloat dist = hypot(pb.x - pa.x, pb.y - pa.y);
+
+    if (_pinchIdx == -1) {
+        CGPoint mid = CGPointMake((pa.x + pb.x) * 0.5, (pa.y + pb.y) * 0.5);
+        int idx = -1;
+        if (!_stickHidden && [self stickHit:mid]) {
+            idx = -2;
+        } else {
+            for (int i = 0; i < GB_NBTN; i++) {
+                if (_hidden[i]) continue;
+                if (CGRectContainsPoint(CGRectInset(_btn[i].frame, -14.0, -14.0), mid)) {
+                    idx = i;
+                    break;
+                }
+            }
+        }
+        if (idx == -1) return NO;
+        _pinchIdx = idx;
+        _pinchStart = (idx == -2) ? _stickScale : _scale[idx];
+        _pinchDist0 = dist > 1.0 ? dist : 1.0;
+        _dragTouch = nil;
+        _dragIdx = -1;
+        return YES;
+    }
+
+    CGFloat v = _pinchStart * (dist / _pinchDist0);
+    if (v < 0.55f) v = 0.55f;
+    if (v > 2.6f) v = 2.6f;
+    if (_pinchIdx == -2) _stickScale = v;
+    else if (_pinchIdx >= 0) _scale[_pinchIdx] = v;
+    [self setNeedsLayout];
+    return YES;
+}
+
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
 {
     CGFloat w = self.bounds.size.width, h = self.bounds.size.height;
     UIEdgeInsets si = self.safeAreaInsets;
     CGFloat uw = w - si.left - si.right, uh = h - si.top - si.bottom;
 
-    for (UITouch *t in touches) {
-        CGPoint p = [t locationInView:self];
-
-        if (_edit) {
-            if (_dragTouch || _pinch.state == UIGestureRecognizerStateBegan) continue;
+    if (_edit && !_dragTouch) {
+        for (UITouch *t in touches) {
+            CGPoint p = [t locationInView:self];
             if (!_stickHidden && [self stickHit:p]) {
                 _dragTouch = t;
                 _dragIdx = -2;
                 _dragOffset = CGPointMake(si.left + _stickPos.x * uw - p.x,
                                           si.top + _stickPos.y * uh - p.y);
-                continue;
+                break;
             }
             int b = [self buttonAt:p];
             if (b >= 0) {
@@ -2128,21 +2174,16 @@ static NSString *const kGBLayoutKey = @"gbpad.layout.v2";
                 _dragIdx = b;
                 _dragOffset = CGPointMake(si.left + _pos[b].x * uw - p.x,
                                           si.top + _pos[b].y * uh - p.y);
+                break;
             }
-            continue;
-        }
-
-        if (!_stickTouch && [self stickHit:p]) {
-            _stickTouch = t;
-            [self updateStick:p];
-            continue;
-        }
-        int b = [self buttonAt:p];
-        if (b >= 0) {
-            _assign[@((uintptr_t)t)] = @(b);
-            [self refreshButtons];
         }
     }
+
+    if (_edit && [self handlePinchFrom:event phase:UITouchPhaseBegan]) {
+        [self rebuildFrom:event];
+        return;
+    }
+    [self rebuildFrom:event];
 }
 
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
@@ -2152,9 +2193,16 @@ static NSString *const kGBLayoutKey = @"gbpad.layout.v2";
     CGFloat uw = (w - si.left - si.right) > 1.0 ? (w - si.left - si.right) : 1.0;
     CGFloat uh = (h - si.top - si.bottom) > 1.0 ? (h - si.top - si.bottom) : 1.0;
 
-    for (UITouch *t in touches) {
-        if (_edit && t == _dragTouch) {
-            CGPoint p = [t locationInView:self];
+    if (_edit && [self handlePinchFrom:event phase:UITouchPhaseMoved]) {
+        [self rebuildFrom:event];
+        return;
+    }
+
+    if (_edit && _dragTouch) {
+        UITouchPhase ph = _dragTouch.phase;
+        if (ph == UITouchPhaseMoved || ph == UITouchPhaseBegan ||
+            ph == UITouchPhaseStationary) {
+            CGPoint p = [_dragTouch locationInView:self];
             CGFloat nx = (p.x + _dragOffset.x - si.left) / uw;
             CGFloat ny = (p.y + _dragOffset.y - si.top) / uh;
             nx = fminf(fmaxf(nx, 0.0f), 1.0f);
@@ -2165,45 +2213,63 @@ static NSString *const kGBLayoutKey = @"gbpad.layout.v2";
                 _pos[_dragIdx] = CGPointMake(nx, ny);
             }
             [self setNeedsLayout];
-            continue;
         }
-        if (t == _stickTouch) {
-            [self updateStick:[t locationInView:self]];
-            continue;
-        }
-        NSNumber *key = @((uintptr_t)t);
-        if (!_assign[key]) continue;
-        int b = [self buttonAt:[t locationInView:self]];
-        if (b >= 0) _assign[key] = @(b);
-        else [_assign removeObjectForKey:key];
-        [self refreshButtons];
     }
+    [self rebuildFrom:event];
 }
 
 - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
 {
-    for (UITouch *t in touches) {
-        if (_edit && t == _dragTouch) {
-            _dragTouch = nil;
-            _dragIdx = -1;
-            [self saveLayout];
-            continue;
-        }
-        if (t == _stickTouch) {
-            _stickTouch = nil;
-            g_gbStickTouch[0] = 0.0f;
-            g_gbStickTouch[1] = 0.0f;
-            [self placeKnob:CGPointZero];
-            continue;
-        }
-        [_assign removeObjectForKey:@((uintptr_t)t)];
-        [self refreshButtons];
+    if (_pinchIdx != -1) {
+        [self saveLayout];
+        _pinchIdx = -1;
     }
+    if (_edit && _dragTouch) {
+        _dragTouch = nil;
+        _dragIdx = -1;
+        [self saveLayout];
+    }
+    [self rebuildFrom:event];
 }
 
 - (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
 {
-    [self touchesEnded:touches withEvent:event];
+    if (_pinchIdx != -1) {
+        [self saveLayout];
+        _pinchIdx = -1;
+    }
+    if (_edit && _dragTouch) {
+        _dragTouch = nil;
+        _dragIdx = -1;
+    }
+    // A cancel can arrive with no matching `ended`. Treat it as "every finger
+    // is gone" so nothing is left latched.
+    _assign = [NSMutableDictionary dictionary];
+    _stickTouch = nil;
+    g_gbHeldTouch = 0;
+    g_gbStickTouch[0] = 0.0f;
+    g_gbStickTouch[1] = 0.0f;
+    [self placeKnob:CGPointZero];
+    [self refreshButtons];
+}
+
+// Watchdog on the display link. Even if a cancel path is missed entirely, the
+// held set cannot outlive the frame in which nothing is actually assigning.
+- (void)sanityCheck
+{
+    if (_edit) return;
+    unsigned n = 0;
+    for (NSNumber *k in _assign) n |= (1u << [_assign[k] intValue]);
+    if (n != g_gbHeldTouch) {
+        g_gbHeldTouch = n;
+        [self refreshButtons];
+    }
+    if (!_stickTouch && (g_gbStickTouch[0] != 0.0f || g_gbStickTouch[1] != 0.0f)
+        && g_gbPadStick == 0) {
+        g_gbStickTouch[0] = 0.0f;
+        g_gbStickTouch[1] = 0.0f;
+        [self placeKnob:CGPointZero];
+    }
 }
 
 - (void)startDriving
@@ -2216,6 +2282,7 @@ static NSString *const kGBLayoutKey = @"gbpad.layout.v2";
 
 - (void)onFrame
 {
+    [self sanityCheck];
     gbpad_frame();
 }
 
@@ -2264,22 +2331,38 @@ static void gbpad_install_overlay(int attempt)
 
 // Everything below talks to the controller through the ObjC runtime, so there
 // is no compile-time dependency on GameController headers or the framework.
+// Every call below is guarded. On iOS the extendedGamepad profile does not
+// always carry every element - leftThumbstickButton is missing on several
+// MFi pads - and an unguarded objc_msgSend on a nil element raises, which
+// tears down the whole valueChangedHandler block. The first exception made
+// every later press invisible, which is why the pad "connected but did
+// nothing".
+static id gb_elem(id pad, const char *name)
+{
+    if (!pad) return nil;
+    SEL s = sel_registerName(name);
+    if (![(id)pad respondsToSelector:s]) return nil;
+    return ((id (*)(id, SEL))objc_msgSend)(pad, s);
+}
+
 static int gb_pressed(id pad, const char *name)
 {
-    if (!pad) return 0;
-    id b = ((id (*)(id, SEL))objc_msgSend)(pad, sel_registerName(name));
+    id b = gb_elem(pad, name);
     if (!b) return 0;
-    return ((BOOL (*)(id, SEL))objc_msgSend)(b, sel_registerName("isPressed")) ? 1 : 0;
+    SEL s = sel_registerName("isPressed");
+    if (![(id)b respondsToSelector:s]) return 0;
+    return ((BOOL (*)(id, SEL))objc_msgSend)(b, s) ? 1 : 0;
 }
 
 static float gb_axis(id owner, const char *stickName, const char *axisName)
 {
-    if (!owner) return 0.0f;
-    id s = ((id (*)(id, SEL))objc_msgSend)(owner, sel_registerName(stickName));
+    id s = gb_elem(owner, stickName);
     if (!s) return 0.0f;
-    id a = ((id (*)(id, SEL))objc_msgSend)(s, sel_registerName(axisName));
+    id a = gb_elem(s, axisName);
     if (!a) return 0.0f;
-    return ((float (*)(id, SEL))objc_msgSend)(a, sel_registerName("value"));
+    SEL v = sel_registerName("value");
+    if (![(id)a respondsToSelector:v]) return 0.0f;
+    return ((float (*)(id, SEL))objc_msgSend)(a, v);
 }
 
 static void gbpad_install_gamecontroller(void)
@@ -2301,61 +2384,86 @@ static void gbpad_install_gamecontroller(void)
     }
 
     void (^attach)(id) = ^(id c) {
-        id g = ((id (*)(id, SEL))objc_msgSend)(c, sel_registerName("extendedGamepad"));
+        if (!c) return;
+        id g = gb_elem(c, "extendedGamepad");
+        if (!g) g = gb_elem(c, "gamepad");   // basic profile still has A/B/Start
         if (!g) {
-            fprintf(stderr, TAG "controller connected but has no extendedGamepad\n");
+            fprintf(stderr, TAG "controller connected but has no gamepad profile\n");
             return;
         }
+        fprintf(stderr, TAG "controller attached, profile=%s\n",
+                (gb_elem(c, "extendedGamepad") ? "extended" : "basic"));
 
         // Feed the same virtual device the overlay writes to, so the game only
         // ever sees one input source.
         void (^handler)(id, id) = ^(id pad, id element) {
             (void)element;
-            unsigned m = 0;
-            if (gb_pressed(pad, "buttonA"))     m |= 1u << GB_SOUTH;
-            if (gb_pressed(pad, "buttonB"))     m |= 1u << GB_EAST;
-            if (gb_pressed(pad, "buttonX"))     m |= 1u << GB_WEST;
-            if (gb_pressed(pad, "buttonY"))     m |= 1u << GB_NORTH;
-            if (gb_pressed(pad, "leftShoulder"))  m |= 1u << GB_LB;
-            if (gb_pressed(pad, "rightShoulder")) m |= 1u << GB_RB;
-            if (gb_pressed(pad, "buttonMenu"))  m |= 1u << GB_START;
-            if (gb_pressed(pad, "buttonOptions")) m |= 1u << GB_SELECT;
-            if (gb_pressed(pad, "dpadUp"))      m |= 1u << GB_DUP;
-            if (gb_pressed(pad, "dpadDown"))    m |= 1u << GB_DDOWN;
-            if (gb_pressed(pad, "dpadLeft"))    m |= 1u << GB_DLEFT;
-            if (gb_pressed(pad, "dpadRight"))   m |= 1u << GB_DRIGHT;
-            if (gb_pressed(pad, "leftTrigger")) m |= 1u << GB_LT;
-            if (gb_pressed(pad, "rightTrigger")) m |= 1u << GB_RT;
-            if (gb_pressed(pad, "leftThumbstickButton"))  m |= 1u << GB_LSTICK;
-            if (gb_pressed(pad, "rightThumbstickButton")) m |= 1u << GB_RSTICK;
-            g_gbHeldPad = m;
+            @try {
+                unsigned m = 0;
+                if (gb_pressed(pad, "buttonA"))     m |= 1u << GB_SOUTH;
+                if (gb_pressed(pad, "buttonB"))     m |= 1u << GB_EAST;
+                if (gb_pressed(pad, "buttonX"))     m |= 1u << GB_WEST;
+                if (gb_pressed(pad, "buttonY"))     m |= 1u << GB_NORTH;
+                if (gb_pressed(pad, "leftShoulder"))  m |= 1u << GB_LB;
+                if (gb_pressed(pad, "rightShoulder")) m |= 1u << GB_RB;
+                if (gb_pressed(pad, "buttonMenu"))  m |= 1u << GB_START;
+                if (gb_pressed(pad, "buttonOptions")) m |= 1u << GB_SELECT;
+                if (gb_pressed(pad, "dpadUp"))      m |= 1u << GB_DUP;
+                if (gb_pressed(pad, "dpadDown"))    m |= 1u << GB_DDOWN;
+                if (gb_pressed(pad, "dpadLeft"))    m |= 1u << GB_DLEFT;
+                if (gb_pressed(pad, "dpadRight"))   m |= 1u << GB_DRIGHT;
+                if (gb_pressed(pad, "leftTrigger")) m |= 1u << GB_LT;
+                if (gb_pressed(pad, "rightTrigger")) m |= 1u << GB_RT;
+                if (gb_pressed(pad, "leftThumbstickButton"))  m |= 1u << GB_LSTICK;
+                if (gb_pressed(pad, "rightThumbstickButton")) m |= 1u << GB_RSTICK;
+                g_gbHeldPad = m;
 
-            float x = gb_axis(pad, "leftThumbstick", "xAxis");
-            float y = gb_axis(pad, "leftThumbstick", "yAxis");
-            float dx = gb_axis(pad, "dpad", "xAxis");
-            float dy = gb_axis(pad, "dpad", "yAxis");
-            if (fabsf(dx) > 0.5f) x = dx;
-            if (fabsf(dy) > 0.5f) y = dy;
-            if (fabsf(x) < 0.14f) x = 0.0f;
-            if (fabsf(y) < 0.14f) y = 0.0f;
-            g_gbStickPad[0] = x;
-            g_gbStickPad[1] = y;
-            g_gbPadStick = (x != 0.0f || y != 0.0f) ? 1 : 0;
+                float x = gb_axis(pad, "leftThumbstick", "xAxis");
+                float y = gb_axis(pad, "leftThumbstick", "yAxis");
+                float dx = gb_axis(pad, "dpad", "xAxis");
+                float dy = gb_axis(pad, "dpad", "yAxis");
+                if (fabsf(dx) > 0.5f) x = dx;
+                if (fabsf(dy) > 0.5f) y = dy;
+                if (fabsf(x) < 0.14f) x = 0.0f;
+                if (fabsf(y) < 0.14f) y = 0.0f;
+                g_gbStickPad[0] = x;
+                g_gbStickPad[1] = y;
+                g_gbPadStick = (x != 0.0f || y != 0.0f) ? 1 : 0;
+            } @catch (NSException *ex) {
+                fprintf(stderr, TAG "gamepad handler threw: %s\n",
+                        [[ex reason] UTF8String]);
+                g_gbHeldPad = 0;
+                g_gbStickPad[0] = g_gbStickPad[1] = 0.0f;
+                g_gbPadStick = 0;
+            }
         };
 
-        ((void (*)(id, SEL, id))objc_msgSend)(c, sel_registerName("setHandlerQueue:"),
-                                              dispatch_get_main_queue());
-        ((void (*)(id, SEL, id))objc_msgSend)(g, sel_registerName("setValueChangedHandler:"),
-                                              handler);
-        fprintf(stderr, TAG "extended gamepad attached\n");
+        SEL setQueue = sel_registerName("setHandlerQueue:");
+        if ([c respondsToSelector:setQueue])
+            ((void (*)(id, SEL, id))objc_msgSend)(c, setQueue, dispatch_get_main_queue());
+
+        SEL setH = sel_registerName("setValueChangedHandler:");
+        if (![g respondsToSelector:setH]) {
+            fprintf(stderr, TAG "profile has no setValueChangedHandler\n");
+            return;
+        }
+        // The profile's handler has to be copied onto the heap: the block
+        // above is stack-allocated and GameController keeps it well past this
+        // function. Without the copy the handler ran once and turned to junk.
+        id blk = [handler copy];
+        ((void (*)(id, SEL, id))objc_msgSend)(g, setH, blk);
+        fprintf(stderr, TAG "extended gamepad valueChangedHandler installed\n");
     };
 
     NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
     [nc addObserverForName:@"GCControllerDidConnectNotification"
-                    object:nil queue:nil
-                usingBlock:^(NSNotification *n) { attach(n.object); }];
+                    object:nil queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *n) {
+                    fprintf(stderr, TAG "GCControllerDidConnect\n");
+                    attach(n.object);
+                }];
     [nc addObserverForName:@"GCControllerDidDisconnectNotification"
-                    object:nil queue:nil
+                    object:nil queue:[NSOperationQueue mainQueue]
                 usingBlock:^(NSNotification *n) {
                     (void)n;
                     g_gbHeldPad = 0;
@@ -2365,15 +2473,17 @@ static void gbpad_install_gamecontroller(void)
                 }];
 
     SEL selControllers = sel_registerName("controllers");
-    id existing = ((id (*)(id, SEL))objc_msgSend)((id)gc, selControllers);
-    if (existing) {
-        for (id c in (NSArray *)existing) attach(c);
+    if ([(id)gc respondsToSelector:selControllers]) {
+        id existing = ((id (*)(id, SEL))objc_msgSend)((id)gc, selControllers);
+        if (existing) {
+            for (id c in (NSArray *)existing) attach(c);
+        }
     }
 
     SEL selDiscover = sel_registerName(
         "startWirelessControllerDiscoveryWithCompletionHandler:");
-    if ([gc respondsToSelector:selDiscover])
-        ((void (*)(id, SEL, id))objc_msgSend)(gc, selDiscover, nil);
+    if ([(id)gc respondsToSelector:selDiscover])
+        ((void (*)(id, SEL, id))objc_msgSend)((id)gc, selDiscover, nil);
     fprintf(stderr, TAG "wireless controller discovery started\n");
 }
 
