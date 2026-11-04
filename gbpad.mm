@@ -455,6 +455,8 @@ static int g_evId = 1;
 // Where InputDevice keeps the timestamp it judges events against. Borrowing it
 // keeps queued events neither stale nor from the future.
 static int g_devTimeOff = 280;
+static MethodInfo *g_timeNow = NULL;
+static int g_timeIsFloat = 0;
 static void *g_clockDevice = NULL;
 
 // Direct state writes. The queued-event path never reaches device state on
@@ -667,12 +669,34 @@ static int stage1(void)
         g_evSizeOff   = nS;
         g_evDeviceOff = nD;
         g_evTypeFound = 1;
-        // Field widths come from the gap to the next field, so a ushort
-        // sizeInBytes/deviceId pair is not overwritten by a 4-byte store.
-        int nextS = (nD > nS) ? nD : (nI >= 0 ? nI : (nTi >= 0 ? nTi : 20));
-        int nextD = (nI >= 0 && nI > nD) ? nI : (nTi >= 0 && nTi > nD ? nTi : 20);
+        // A field's width is the distance to the NEAREST field that follows it.
+        // Taking eventId as "the next field" after deviceId gave width 10,
+        // which ran a 10-byte store from offset 6 straight through time@8 and
+        // wiped the timestamp of every queued event. The nearest successor of
+        // deviceId@6 is time@8, so the width is 2.
+        int f[4];
+        int nf, k, best;
+
+        nf = 0; f[nf++] = 20;
+        if (nD  > nS)  f[nf++] = nD;
+        if (nTi > nS)  f[nf++] = nTi;
+        if (nI  > nS)  f[nf++] = nI;
+        best = 20;
+        for (k = 0; k < nf; k++) if (f[k] > nS && f[k] < best) best = f[k];
+        int nextS = best;
+
+        nf = 0; f[nf++] = 20;
+        if (nS  > nD)  f[nf++] = nS;
+        if (nTi > nD)  f[nf++] = nTi;
+        if (nI  > nD)  f[nf++] = nI;
+        best = 20;
+        for (k = 0; k < nf; k++) if (f[k] > nD && f[k] < best) best = f[k];
+        int nextD = best;
+
         g_evSizeWidth = nextS - nS;
         g_evDevWidth  = nextD - nD;
+        if (g_evSizeWidth < 1 || g_evSizeWidth > 4) g_evSizeWidth = 2;
+        if (g_evDevWidth  < 1 || g_evDevWidth  > 4) g_evDevWidth  = 2;
     } else {
         // Confirmed layout of UnityEngineInternal.Input.NativeInputEvent, read
         // off the real type name in the device log:
@@ -716,6 +740,16 @@ static int stage1(void)
     int lu = inner(field_off_any(cDevice, luNames, 2));
     if (lu >= 0) g_devTimeOff = lu;
     fprintf(stderr, TAG "clock: device.m_LastUpdateTimeInternal @%d\n", g_devTimeOff);
+    Il2CppClass *cTime = find_class_any(domain, "UnityEngine", "Time");
+    if (cTime) {
+        g_timeNow = f_class_get_method_from_name(cTime, "get_realtimeSinceStartupAsDouble", 0);
+        g_timeIsFloat = 0;
+        if (!g_timeNow) {
+            g_timeNow = f_class_get_method_from_name(cTime, "get_realtimeSinceStartup", 0);
+            g_timeIsFloat = 1;
+        }
+    }
+    fprintf(stderr, TAG "clock: Time fallback %s\n", g_timeNow ? "ok" : "MISSING");
 
     fprintf(stderr, TAG "resolved device: m_StateBlock@%d(size %d) m_DeviceId@%d\n",
             g_stateBlockOff, g_stateBlockSize, g_deviceIdOff);
@@ -917,9 +951,37 @@ static void gbpad_bump_id(void *buf)
 // before it ever reaches the device state.
 static void gbpad_stamp_time(void *buf)
 {
-    if (!buf || !g_clockDevice || g_devTimeOff < 0) return;
+    if (!buf) return;
     double t = 0.0;
-    memcpy(&t, (unsigned char *)g_clockDevice + g_devTimeOff, 8);
+
+    if (g_clockDevice && g_devTimeOff >= 0)
+        memcpy(&t, (unsigned char *)g_clockDevice + g_devTimeOff, 8);
+
+    // m_LastUpdateTimeInternal is only written once the device has updated at
+    // least once. If the event path is still being established it reads 0, and
+    // a zero timestamp makes the event look older than the session. Unity's own
+    // realtime clock is the same time base InputSystem starts from.
+    if (t <= 0.0 && g_timeNow) {
+        Il2CppException *e = NULL;
+        Il2CppObject *r = f_runtime_invoke(g_timeNow, NULL, NULL, &e);
+        if (r && !e) {
+            // il2cpp_runtime_invoke hands back a pointer to the return value.
+            // A boxed return would carry a 16-byte object header, so try both
+            // and keep whichever lands in a plausible clock range.
+            double v = 0.0;
+            if (g_timeIsFloat) {
+                float f = 0.0f;
+                memcpy(&f, (const void *)r, 4);
+                if (!(f > 0.0f && f < 1.0e6f)) memcpy(&f, (const char *)r + 16, 4);
+                if (f > 0.0f && f < 1.0e6f) v = (double)f;
+            } else {
+                memcpy(&v, (const void *)r, 8);
+                if (!(v > 0.0 && v < 1.0e6)) memcpy(&v, (const char *)r + 16, 8);
+                if (!(v > 0.0 && v < 1.0e6)) v = 0.0;
+            }
+            t = v;
+        }
+    }
     if (t <= 0.0) return;
     memcpy((unsigned char *)buf + g_evTimeOff, &t, 8);
 }
