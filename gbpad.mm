@@ -401,6 +401,7 @@ static Il2CppClass *g_cStateBlock = NULL;
 static Il2CppClass *g_cInputEvent = NULL;
 static Il2CppClass *g_cStateEvent = NULL;
 static Il2CppClass *g_cStick = NULL;
+static Il2CppClass *g_cDpad = NULL;
 static Il2CppClass *g_cGamepadState = NULL;
 static Il2CppClass *g_cInputControl = NULL;
 static MethodInfo *g_readValueAsObject = NULL;
@@ -530,6 +531,7 @@ static int stage1(void)
     g_cInputEvent = f_class_from_name(img, "UnityEngine.InputSystem.LowLevel", "InputEvent");
     g_cStateEvent = f_class_from_name(img, "UnityEngine.InputSystem.LowLevel", "StateEvent");
     g_cStick      = f_class_from_name(img, "UnityEngine.InputSystem.Controls", "StickControl");
+    g_cDpad       = f_class_from_name(img, "UnityEngine.InputSystem.Controls", "DpadControl");
     g_cInputControl = f_class_from_name(img, "UnityEngine.InputSystem", "InputControl");
     g_cKeyboard   = f_class_from_name(img, "UnityEngine.InputSystem", "Keyboard");
     g_cKeyControl = f_class_from_name(img, "UnityEngine.InputSystem.Controls", "KeyControl");
@@ -542,6 +544,8 @@ static int stage1(void)
     fprintf(stderr, TAG "class InputEvent      %s\n", g_cInputEvent ? "ok" : "MISSING");
     fprintf(stderr, TAG "class StateEvent      %s\n", g_cStateEvent ? "ok" : "MISSING");
     fprintf(stderr, TAG "class StickControl    %s\n", g_cStick ? "ok" : "MISSING");
+    fprintf(stderr, TAG "class DpadControl     %s\n", g_cDpad ? "ok" : "MISSING");
+    if (g_cDpad) dump_methods(g_cDpad, "DpadControl", "get_");
     fprintf(stderr, TAG "class InputControl    %s\n", g_cInputControl ? "ok" : "MISSING");
     fprintf(stderr, TAG "class Keyboard        %s\n", g_cKeyboard ? "ok" : "MISSING");
     fprintf(stderr, TAG "class KeyControl      %s\n", g_cKeyControl ? "ok" : "MISSING");
@@ -1406,12 +1410,41 @@ enum {
     GB_SELECT,
     GB_LB,
     GB_RB,
+    GB_DUP,
+    GB_DDOWN,
+    GB_DLEFT,
+    GB_DRIGHT,
+    GB_LT,
+    GB_RT,
+    GB_LSTICK,
+    GB_RSTICK,
     GB_NBTN
 };
 
 static const char *const kGBGetter[GB_NBTN] = {
     "get_buttonSouth", "get_buttonEast", "get_buttonWest", "get_buttonNorth",
-    "get_startButton", "get_selectButton", "get_leftShoulder", "get_rightShoulder"
+    "get_startButton", "get_selectButton", "get_leftShoulder", "get_rightShoulder",
+    "get_up", "get_down", "get_left", "get_right",
+    "get_leftTrigger", "get_rightTrigger", "get_leftStickButton", "get_rightStickButton"
+};
+
+// Dpad children hang off the dpad control rather than off Gamepad, so the
+// parent getter has to be resolved first. Everything else is one level deep.
+static const char *const kGBParent[GB_NBTN] = {
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    "get_dpad", "get_dpad", "get_dpad", "get_dpad",
+    NULL, NULL, NULL, NULL
+};
+
+// Triggers are analog float controls, not bits: writing a bit into their state
+// would put 1.0f into the low byte and leave the rest of the float as garbage.
+static const unsigned char kGBFloat[GB_NBTN] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0
+};
+
+static const char *const kGBGlyph[GB_NBTN] = {
+    "A", "B", "X", "Y", "START", "BACK", "LB", "RB",
+    "\xE2\x96\xB2", "\xE2\x96\xBC", "\xE2\x97\x80", "\xE2\x96\xB6", "LT", "RT", "LS", "RS"
 };
 
 static MethodInfo *g_gbGetter[GB_NBTN];
@@ -1444,16 +1477,41 @@ static volatile int g_gbLive = 0;       // set once the overlay is on screen
 static void gbpad_resolve_button(int i)
 {
     if (g_gbBitKnown[i] || !g_device || !g_gbStateBase) return;
+    if (g_stateBlockOff < 0 || g_byteOffOff < 0 || g_bitOffOff < 0) return;
+
+    // Dpad children hang off the dpad control, not off Gamepad. Walk to the
+    // parent object first so the child getter has something to invoke on.
+    Il2CppObject *owner = g_device;
+    if (kGBParent[i]) {
+        if (!g_cDpad) {
+            fprintf(stderr, TAG "button %s: DpadControl class missing\n", kGBGetter[i]);
+            return;
+        }
+        MethodInfo *pg = f_class_get_method_from_name(g_cGamepad, kGBParent[i], 0);
+        if (!pg) {
+            fprintf(stderr, TAG "button %s: parent getter %s not found\n",
+                    kGBGetter[i], kGBParent[i]);
+            return;
+        }
+        Il2CppException *pe = NULL;
+        owner = f_runtime_invoke(pg, g_device, NULL, &pe);
+        if (!owner || pe) {
+            fprintf(stderr, TAG "button %s: parent %s returned null\n",
+                    kGBGetter[i], kGBParent[i]);
+            return;
+        }
+    }
+
     if (!g_gbGetter[i])
-        g_gbGetter[i] = f_class_get_method_from_name(g_cGamepad, kGBGetter[i], 0);
+        g_gbGetter[i] = f_class_get_method_from_name(
+            kGBParent[i] ? g_cDpad : g_cGamepad, kGBGetter[i], 0);
     if (!g_gbGetter[i]) {
         fprintf(stderr, TAG "button %s: getter not found\n", kGBGetter[i]);
         return;
     }
-    if (g_stateBlockOff < 0 || g_byteOffOff < 0 || g_bitOffOff < 0) return;
 
     Il2CppException *e = NULL;
-    Il2CppObject *c = f_runtime_invoke(g_gbGetter[i], g_device, NULL, &e);
+    Il2CppObject *c = f_runtime_invoke(g_gbGetter[i], owner, NULL, &e);
     if (!c || e) return;
 
     uint32_t byteOff = 0, bitOff = 0;
@@ -1481,14 +1539,20 @@ static void gbpad_resolve_button(int i)
         return;
     }
 
-    // bitOff is counted from the start of the buttons field, so a bit past the
-    // first byte belongs to the next one. Observed values run 4..13, i.e. the
-    // low half of a 16-bit field, which spans two bytes.
-    g_gbByte[i] = (int)(rel + bitOff / 8);
-    g_gbBit[i]  = (int)(bitOff % 8);
+    if (kGBFloat[i]) {
+        // Analog control: a float lives at the byte offset, no bit index.
+        g_gbByte[i] = (int)rel;
+        g_gbBit[i] = -1;
+    } else {
+        // bitOff is counted from the start of the buttons field, so a bit past
+        // the first byte belongs to the next one.
+        g_gbByte[i] = (int)(rel + bitOff / 8);
+        g_gbBit[i]  = (int)(bitOff % 8);
+    }
     g_gbBitKnown[i] = 1;
-    fprintf(stderr, TAG "button %-18s state[%d] bit %d  (abs=%u root=%u rel=%u bit=%u)\n",
-            kGBGetter[i], g_gbByte[i], g_gbBit[i], byteOff, g_devByteOff, rel, bitOff);
+    fprintf(stderr, TAG "control %-18s state[%d] %s (abs=%u root=%u rel=%u bit=%u)\n",
+            kGBGetter[i], g_gbByte[i], kGBFloat[i] ? "float" : "bit",
+            byteOff, g_devByteOff, rel, bitOff);
 }
 
 static void gbpad_resolve_buttons(void)
@@ -1538,13 +1602,20 @@ static void gbpad_frame(void)
     unsigned char *evp = (g_evBuffer && g_payloadOff >= 0)
                        ? (unsigned char *)g_evBuffer + g_payloadOff : NULL;
 
-    // Touch only the bits we own. Clearing the whole word would stomp the dpad
-    // and the triggers, which we do not drive and which the device may be
-    // reporting on its own.
+    // Touch only the state we own. Clearing whole words would stomp controls
+    // the device may be reporting on its own.
     for (int i = 0; i < GB_NBTN; i++) {
         if (!g_gbBitKnown[i]) continue;
-        unsigned char mask = (unsigned char)(1u << g_gbBit[i]);
         int on = (held & (1u << i)) ? 1 : 0;
+        if (g_gbBit[i] < 0) {
+            // Analog trigger: a full float, not a bit. Bitwise writes would
+            // leave 1.0f's upper bytes as whatever was already there.
+            float f = on ? 1.0f : 0.0f;
+            memcpy(live + g_gbByte[i], &f, 4);
+            if (evp) memcpy(evp + g_gbByte[i], &f, 4);
+            continue;
+        }
+        unsigned char mask = (unsigned char)(1u << g_gbBit[i]);
         unsigned char *p = live + g_gbByte[i];
         if (on) *p |= mask; else *p &= (unsigned char)~mask;
         if (evp) {
@@ -1579,6 +1650,8 @@ static void gbpad_frame(void)
 - (void)startDriving;
 @end
 
+static NSString *const kGBLayoutKey = @"gbpad.layout.v1";
+
 @implementation GBPadOverlay {
     UIView *_stickBase;
     UIView *_stickKnob;
@@ -1589,6 +1662,71 @@ static void gbpad_frame(void)
     CGFloat _stickRadius;
     CADisplayLink *_link;
     BOOL _laid;
+
+    // Layout is stored normalised (0..1 of the overlay) so it survives a
+    // rotation or a different device without any rescaling pass.
+    CGPoint _pos[GB_NBTN];
+    CGPoint _stickPos;
+    CGFloat _stickScale;
+
+    BOOL _edit;
+    UITouch *_dragTouch;
+    int _dragIdx;              // -2 = stick, -1 = none, else button index
+    CGPoint _dragOffset;
+    UILabel *_hint;
+    UIButton *_reset;
+}
+
+
+
+// Defaults were taken off the working hard-coded layout and only normalised,
+// so the first launch looks exactly like the version that already played.
+- (void)defaultLayout
+{
+    static const float dflt[GB_NBTN][2] = {
+        [GB_SOUTH]  = {0.881f, 0.861f},
+        [GB_EAST]   = {0.936f, 0.741f},
+        [GB_WEST]   = {0.825f, 0.741f},
+        [GB_NORTH]  = {0.881f, 0.620f},
+        [GB_START]  = {0.931f, 0.100f},
+        [GB_SELECT] = {0.849f, 0.100f},
+        [GB_LB]     = {0.835f, 0.509f},
+        [GB_RB]     = {0.926f, 0.509f},
+        [GB_DUP]    = {0.440f, 0.680f},
+        [GB_DDOWN]  = {0.440f, 0.880f},
+        [GB_DLEFT]  = {0.350f, 0.780f},
+        [GB_DRIGHT] = {0.530f, 0.780f},
+        [GB_LT]     = {0.835f, 0.420f},
+        [GB_RT]     = {0.926f, 0.420f},
+        [GB_LSTICK] = {0.115f, 0.935f},
+        [GB_RSTICK] = {0.881f, 0.955f},
+    };
+    for (int i = 0; i < GB_NBTN; i++)
+        _pos[i] = CGPointMake(dflt[i][0], dflt[i][1]);
+    _stickPos = CGPointMake(0.115f, 0.750f);
+    _stickScale = 1.0f;
+}
+
+- (void)loadLayout
+{
+    [self defaultLayout];
+    NSArray *a = [[NSUserDefaults standardUserDefaults] arrayForKey:kGBLayoutKey];
+    if (a.count != GB_NBTN * 2 + 1) return;
+    for (int i = 0; i < GB_NBTN; i++)
+        _pos[i] = CGPointMake([a[i * 2] floatValue], [a[i * 2 + 1] floatValue]);
+    _stickPos = CGPointMake([a[GB_NBTN * 2] floatValue], [a[GB_NBTN * 2 + 1] floatValue]);
+}
+
+- (void)saveLayout
+{
+    NSMutableArray *a = [NSMutableArray arrayWithCapacity:GB_NBTN * 2 + 1];
+    for (int i = 0; i < GB_NBTN; i++) {
+        [a addObject:@(_pos[i].x)];
+        [a addObject:@(_pos[i].y)];
+    }
+    [a addObject:@(_stickPos.x)];
+    [a addObject:@(_stickPos.y)];
+    [[NSUserDefaults standardUserDefaults] setObject:a forKey:kGBLayoutKey];
 }
 
 - (instancetype)initWithFrame:(CGRect)frame
@@ -1602,6 +1740,8 @@ static void gbpad_frame(void)
     self.autoresizingMask = UIViewAutoresizingFlexibleWidth |
                             UIViewAutoresizingFlexibleHeight;
     _assign = [NSMutableDictionary dictionary];
+    _dragIdx = -1;
+    [self loadLayout];
 
     _stickBase = [[UIView alloc] initWithFrame:CGRectZero];
     _stickBase.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.07];
@@ -1617,9 +1757,6 @@ static void gbpad_frame(void)
     _stickKnob.userInteractionEnabled = NO;
     [self addSubview:_stickKnob];
 
-    static const char *const glyph[GB_NBTN] = {
-        "A", "B", "X", "Y", "START", "BACK", "LB", "RB"
-    };
     for (int i = 0; i < GB_NBTN; i++) {
         UIView *b = [[UIView alloc] initWithFrame:CGRectZero];
         b.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.26];
@@ -1628,26 +1765,64 @@ static void gbpad_frame(void)
         b.userInteractionEnabled = NO;
 
         UILabel *l = [[UILabel alloc] initWithFrame:CGRectZero];
-        l.text = [NSString stringWithUTF8String:glyph[i]];
+        l.text = [NSString stringWithUTF8String:kGBGlyph[i]];
         l.textColor = [UIColor colorWithWhite:1.0 alpha:0.88];
-        l.font = [UIFont boldSystemFontOfSize:(i >= GB_START ? 12.0 : 21.0)];
+        CGFloat fs = 11.0;
+        if (i <= GB_NORTH) fs = 21.0;
+        else if (i == GB_DUP || i == GB_DDOWN || i == GB_DLEFT || i == GB_DRIGHT) fs = 15.0;
+        else if (i == GB_START || i == GB_SELECT || i == GB_LB || i == GB_RB) fs = 12.0;
+        l.font = [UIFont boldSystemFontOfSize:fs];
         l.textAlignment = NSTextAlignmentCenter;
         l.backgroundColor = [UIColor clearColor];
+        l.adjustsFontSizeToFitWidth = YES;
+        l.minimumScaleFactor = 0.6;
         l.tag = 99;
         [b addSubview:l];
 
         [self addSubview:b];
         _btn[i] = b;
     }
+
+    UILongPressGestureRecognizer *lp =
+        [[UILongPressGestureRecognizer alloc] initWithTarget:self
+                                                      action:@selector(onLongPress:)];
+    lp.minimumPressDuration = 0.55;
+    lp.cancelsTouchesInView = NO;
+    [self addGestureRecognizer:lp];
+
+    _hint = [[UILabel alloc] initWithFrame:CGRectZero];
+    _hint.text = @"拖动控件调整位置";
+    _hint.textColor = [UIColor colorWithWhite:1.0 alpha:0.85];
+    _hint.font = [UIFont boldSystemFontOfSize:13.0];
+    _hint.textAlignment = NSTextAlignmentCenter;
+    _hint.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.55];
+    _hint.layer.cornerRadius = 8.0;
+    _hint.clipsToBounds = YES;
+    _hint.hidden = YES;
+    _hint.userInteractionEnabled = NO;
+    [self addSubview:_hint];
+
+    _reset = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_reset setTitle:@"重置" forState:UIControlStateNormal];
+    [_reset setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    _reset.titleLabel.font = [UIFont boldSystemFontOfSize:13.0];
+    _reset.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.55];
+    _reset.layer.cornerRadius = 8.0;
+    _reset.hidden = YES;
+    [_reset addTarget:self action:@selector(onReset) forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:_reset];
+
     return self;
 }
 
-- (void)setButton:(int)i center:(CGPoint)c diameter:(CGFloat)d pill:(BOOL)pill
+- (void)sizeFor:(int)i
 {
-    CGFloat bw = pill ? 66.0 : d;
-    CGFloat bh = pill ? 30.0 : d;
-    _btn[i].frame = CGRectMake(c.x - bw * 0.5, c.y - bh * 0.5, bw, bh);
-    _btn[i].layer.cornerRadius = pill ? 9.0 : d * 0.5;
+    CGFloat s = 70.0;
+    if (i == GB_DUP || i == GB_DDOWN || i == GB_DLEFT || i == GB_DRIGHT) s = 56.0;
+    else if (i == GB_LT || i == GB_RT || i == GB_LSTICK || i == GB_RSTICK) s = 56.0;
+    else if (i == GB_START || i == GB_SELECT || i == GB_LB || i == GB_RB) s = 0.0;
+    _btn[i].bounds = CGRectMake(0, 0, s > 0.0 ? s : 66.0, s > 0.0 ? s : 30.0);
+    _btn[i].layer.cornerRadius = s > 0.0 ? s * 0.5 : 9.0;
     UIView *l = [_btn[i] viewWithTag:99];
     l.frame = _btn[i].bounds;
 }
@@ -1658,13 +1833,19 @@ static void gbpad_frame(void)
 
     UIEdgeInsets si = self.safeAreaInsets;
     CGFloat w = self.bounds.size.width, h = self.bounds.size.height;
-    CGFloat margin = 26.0;
-
     CGFloat sd = 168.0;
-    _stickBase.frame = CGRectMake(si.left + margin, h - si.bottom - margin - sd, sd, sd);
+
+    for (int i = 0; i < GB_NBTN; i++) {
+        [self sizeFor:i];
+        _btn[i].center = CGPointMake(si.left + _pos[i].x * (w - si.left - si.right),
+                                     si.top + _pos[i].y * (h - si.top - si.bottom));
+    }
+
+    _stickBase.bounds = CGRectMake(0, 0, sd, sd);
     _stickBase.layer.cornerRadius = sd * 0.5;
-    _stickCenter = CGPointMake(CGRectGetMidX(_stickBase.frame),
-                               CGRectGetMidY(_stickBase.frame));
+    _stickBase.center = CGPointMake(si.left + _stickPos.x * (w - si.left - si.right),
+                                    si.top + _stickPos.y * (h - si.top - si.bottom));
+    _stickCenter = _stickBase.center;
     _stickRadius = sd * 0.5;
 
     CGFloat kd = 70.0;
@@ -1672,39 +1853,16 @@ static void gbpad_frame(void)
     _stickKnob.layer.cornerRadius = kd * 0.5;
     [self placeKnob:CGPointZero];
 
-    CGFloat bs = 70.0, gap = 12.0;
-    CGFloat d = bs * 0.5 + gap * 0.5 + 6.0;
-    CGFloat ex = w - si.right - margin - bs * 0.5;
-    CGFloat sy = h - si.bottom - margin - bs * 0.5;
-    CGFloat cx = ex - d, cy = sy - d;
-
-    [self setButton:GB_EAST  center:CGPointMake(ex, cy) diameter:bs pill:NO];
-    [self setButton:GB_SOUTH center:CGPointMake(cx, sy) diameter:bs pill:NO];
-    [self setButton:GB_NORTH center:CGPointMake(cx, cy - d) diameter:bs pill:NO];
-    [self setButton:GB_WEST  center:CGPointMake(cx - d, cy) diameter:bs pill:NO];
-
-    [self setButton:GB_LB center:CGPointMake(cx - bs * 0.62, cy - d - bs * 0.70)
-           diameter:bs pill:YES];
-    [self setButton:GB_RB center:CGPointMake(cx + bs * 0.62, cy - d - bs * 0.70)
-           diameter:bs pill:YES];
-
-    [self setButton:GB_START center:CGPointMake(w - si.right - margin - 40,
-                                                si.top + margin + 18)
-           diameter:bs pill:YES];
-    [self setButton:GB_SELECT center:CGPointMake(w - si.right - margin - 40 - 78,
-                                                 si.top + margin + 18)
-            diameter:bs pill:YES];
+    _hint.frame = CGRectMake(w * 0.5 - 80, si.top + 6, 160, 28);
+    _reset.frame = CGRectMake(w * 0.5 + 86, si.top + 6, 56, 28);
 
     _laid = YES;
 }
 
 - (void)placeKnob:(CGPoint)v
 {
-    CGPoint c = CGPointMake(_stickCenter.x + v.x * _stickRadius,
-                            _stickCenter.y + v.y * _stickRadius);
-    CGSize k = _stickKnob.bounds.size;
-    _stickKnob.center = c;
-    (void)k;
+    _stickKnob.center = CGPointMake(_stickCenter.x + v.x * _stickRadius,
+                                    _stickCenter.y + v.y * _stickRadius);
 }
 
 - (BOOL)stickHit:(CGPoint)p
@@ -1721,6 +1879,30 @@ static void gbpad_frame(void)
             return i;
     }
     return -1;
+}
+
+- (void)onLongPress:(UILongPressGestureRecognizer *)g
+{
+    if (g.state != UIGestureRecognizerStateBegan) return;
+    _edit = !_edit;
+    _hint.hidden = !_edit;
+    _reset.hidden = !_edit;
+    for (int i = 0; i < GB_NBTN; i++)
+        _btn[i].layer.borderColor = (_edit
+            ? [UIColor colorWithRed:1.0 green:0.85 blue:0.3 alpha:0.95]
+            : [UIColor colorWithWhite:1.0 alpha:0.28]).CGColor;
+    // Lifting every finger when entering edit mode avoids a half-held button
+    // sticking once the same touch starts moving a control instead.
+    [_assign removeAllObjects];
+    g_gbHeldTouch = 0;
+    if (_edit) [self saveLayout];
+}
+
+- (void)onReset
+{
+    [self defaultLayout];
+    [self saveLayout];
+    [self setNeedsLayout];
 }
 
 - (void)updateStick:(CGPoint)p
@@ -1760,8 +1942,32 @@ static void gbpad_frame(void)
 
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
 {
+    CGFloat w = self.bounds.size.width, h = self.bounds.size.height;
+    UIEdgeInsets si = self.safeAreaInsets;
+    CGFloat uw = w - si.left - si.right, uh = h - si.top - si.bottom;
+
     for (UITouch *t in touches) {
         CGPoint p = [t locationInView:self];
+
+        if (_edit) {
+            if (_dragTouch) continue;
+            if ([self stickHit:p]) {
+                _dragTouch = t;
+                _dragIdx = -2;
+                _dragOffset = CGPointMake(_stickPos.x * uw + si.left - p.x,
+                                          _stickPos.y * uh + si.top - p.y);
+                continue;
+            }
+            int b = [self buttonAt:p];
+            if (b >= 0) {
+                _dragTouch = t;
+                _dragIdx = b;
+                _dragOffset = CGPointMake(si.left + _pos[b].x * uw - p.x,
+                                          si.top + _pos[b].y * uh - p.y);
+            }
+            continue;
+        }
+
         if (!_stickTouch && [self stickHit:p]) {
             _stickTouch = t;
             [self updateStick:p];
@@ -1777,7 +1983,26 @@ static void gbpad_frame(void)
 
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
 {
+    CGFloat w = self.bounds.size.width, h = self.bounds.size.height;
+    UIEdgeInsets si = self.safeAreaInsets;
+    CGFloat uw = (w - si.left - si.right) > 1.0 ? (w - si.left - si.right) : 1.0;
+    CGFloat uh = (h - si.top - si.bottom) > 1.0 ? (h - si.top - si.bottom) : 1.0;
+
     for (UITouch *t in touches) {
+        if (_edit && t == _dragTouch) {
+            CGPoint p = [t locationInView:self];
+            CGFloat nx = (p.x + _dragOffset.x - si.left) / uw;
+            CGFloat ny = (p.y + _dragOffset.y - si.top) / uh;
+            nx = fminf(fmaxf(nx, 0.0f), 1.0f);
+            ny = fminf(fmaxf(ny, 0.0f), 1.0f);
+            if (_dragIdx == -2) {
+                _stickPos = CGPointMake(nx, ny);
+            } else if (_dragIdx >= 0) {
+                _pos[_dragIdx] = CGPointMake(nx, ny);
+            }
+            [self setNeedsLayout];
+            continue;
+        }
         if (t == _stickTouch) {
             [self updateStick:[t locationInView:self]];
             continue;
@@ -1794,6 +2019,12 @@ static void gbpad_frame(void)
 - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
 {
     for (UITouch *t in touches) {
+        if (_edit && t == _dragTouch) {
+            _dragTouch = nil;
+            _dragIdx = -1;
+            [self saveLayout];
+            continue;
+        }
         if (t == _stickTouch) {
             _stickTouch = nil;
             g_gbStickTouch[0] = 0.0f;
@@ -1925,6 +2156,14 @@ static void gbpad_install_gamecontroller(void)
             if (gb_pressed(pad, "rightShoulder")) m |= 1u << GB_RB;
             if (gb_pressed(pad, "buttonMenu"))  m |= 1u << GB_START;
             if (gb_pressed(pad, "buttonOptions")) m |= 1u << GB_SELECT;
+            if (gb_pressed(pad, "dpadUp"))      m |= 1u << GB_DUP;
+            if (gb_pressed(pad, "dpadDown"))    m |= 1u << GB_DDOWN;
+            if (gb_pressed(pad, "dpadLeft"))    m |= 1u << GB_DLEFT;
+            if (gb_pressed(pad, "dpadRight"))   m |= 1u << GB_DRIGHT;
+            if (gb_pressed(pad, "leftTrigger")) m |= 1u << GB_LT;
+            if (gb_pressed(pad, "rightTrigger")) m |= 1u << GB_RT;
+            if (gb_pressed(pad, "leftThumbstickButton"))  m |= 1u << GB_LSTICK;
+            if (gb_pressed(pad, "rightThumbstickButton")) m |= 1u << GB_RSTICK;
             g_gbHeldPad = m;
 
             float x = gb_axis(pad, "leftThumbstick", "xAxis");
