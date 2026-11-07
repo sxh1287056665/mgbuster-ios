@@ -161,6 +161,11 @@ workflows:
           test -f /tmp/proj/Libraries/libil2cpp.a
           test -f /tmp/proj/Libraries/libiPhone-lib.a
           test -f /tmp/proj/Data/Managed/Metadata/global-metadata.dat
+          # Windows 打包丢失执行位，这里补回来
+          chmod +x /tmp/proj/*.sh 2>/dev/null || true
+          for f in /tmp/proj/usymtool /tmp/proj/lzma; do if [ -f "$f" ]; then chmod +x "$f"; codesign -f -s - "$f" 2>/dev/null || true; fi; done
+          file /tmp/proj/usymtool /tmp/proj/lzma || true
+          ls -l /tmp/proj/*.sh /tmp/proj/usymtool /tmp/proj/lzma
           echo "payload ok"
 
       - name: Patch project (bitcode, bundle id, archs)
@@ -213,6 +218,9 @@ workflows:
             echo "================ BUILD FAILED rc=$rc ================"
             echo "--- error: ---"
             grep -E 'error:' /tmp/xcodebuild.log | head -40 || true
+            echo "--- script phase / io failures ---"
+            grep -E 'Permission denied|Command PhaseScriptExecution failed|No such file or directory' /tmp/xcodebuild.log | head -20 || true
+            echo "--- compiled units: $(grep -c 'CompileC ' /tmp/xcodebuild.log || true) ---"
             echo "--- failed commands ---"
             grep -E '\*\* BUILD FAILED|The following build commands failed' -A8 /tmp/xcodebuild.log | head -60 || true
             exit 1
