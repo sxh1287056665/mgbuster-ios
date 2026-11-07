@@ -183,15 +183,19 @@ workflows:
           perl -0pi -e 's/PRODUCT_BUNDLE_IDENTIFIER = "com\.whitepeach\.\$\{PRODUCT_NAME:rfc1123identifier\}";/PRODUCT_BUNDLE_IDENTIFIER = "'"$BUNDLE_ID"'";/g' "$PBX"
           perl -0pi -e 's/PRODUCT_BUNDLE_IDENTIFIER = com\.unity3d\.framework;/PRODUCT_BUNDLE_IDENTIFIER = "'"$BUNDLE_ID"'.framework";/g' "$PBX"
           perl -0pi -e 's/ARCHS = armv7;/ARCHS = arm64;/g' "$PBX"
+          # armv7 时代参数，arm64 clang 直接报 unsupported option
+          perl -0pi -e 's/[ \t]*"-mno-thumb",\r?\n//g' "$PBX"
           BIT=$(grep -c 'ENABLE_BITCODE = YES' "$PBX" || true)
           ARM=$(grep -c 'ARCHS = armv7;' "$PBX" || true)
           LEFT=$(grep -c 'com.unity3d.framework' "$PBX" || true)
+          THUMB=$(grep -c 'mno-thumb' "$PBX" || true)
           APPID=$(grep -Ec "^[[:space:]]*PRODUCT_BUNDLE_IDENTIFIER = \"?$BUNDLE_ID\"?;" "$PBX" || true)
           FWID=$(grep -Ec "^[[:space:]]*PRODUCT_BUNDLE_IDENTIFIER = \"?$BUNDLE_ID\.framework\"?;" "$PBX" || true)
-          echo "after: bitcodeYES=$BIT armv7=$ARM appId=$APPID fwId=$FWID unityFW=$LEFT"
+          echo "after: bitcodeYES=$BIT armv7=$ARM appId=$APPID fwId=$FWID unityFW=$LEFT thumb=$THUMB"
           test "$BIT" = "0"
           test "$ARM" = "0"
           test "$LEFT" = "0"
+          test "$THUMB" = "0"
           test "$APPID" = "4"
           test "$FWID" = "4"
           grep -n 'PRODUCT_BUNDLE_IDENTIFIER\|ENABLE_BITCODE\|ARCHS = ' "$PBX"
