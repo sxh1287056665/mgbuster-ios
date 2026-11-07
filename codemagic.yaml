@@ -234,7 +234,7 @@ workflows:
             exit 1
           fi
           grep -q 'BUILD SUCCEEDED' /tmp/xcodebuild.log
-          APP=$(find /tmp/dd/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          APP=$(find /tmp/dd/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' -print -quit)
           test -n "$APP"
           test -d "$APP"
           echo "APP=$APP"
@@ -251,7 +251,7 @@ workflows:
       - name: Package unsigned ipa
         script: |
           set -euo pipefail
-          APP=$(find /tmp/dd/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          APP=$(find /tmp/dd/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' -print -quit)
           test -n "$APP"
           WORK=/tmp/ipa
           rm -rf "$WORK"
@@ -265,7 +265,17 @@ workflows:
           cd "$WORK"
           zip -0 -qry "/tmp/${APP_NAME}-unsigned.ipa" Payload
           ls -lh /tmp/*.ipa
-          unzip -l "/tmp/${APP_NAME}-unsigned.ipa" | head -8
+          unzip -l "/tmp/${APP_NAME}-unsigned.ipa" > /tmp/ipa_list.txt 2>&1 || true
+          sed -n '1,8p' /tmp/ipa_list.txt
+          ENTRIES=$(grep -c 'Payload/' /tmp/ipa_list.txt || true)
+          NFC=$(grep -c 'Info.plist' /tmp/ipa_list.txt || true)
+          META=$(grep -c 'global-metadata.dat' /tmp/ipa_list.txt || true)
+          FW=$(grep -c 'UnityFramework.framework/UnityFramework' /tmp/ipa_list.txt || true)
+          echo "ipa entries=$ENTRIES infoPlists=$NFC metadata=$META unityFw=$FW"
+          test "$ENTRIES" -gt 50
+          test "$NFC" -ge 2
+          test "$META" -ge 1
+          test "$FW" -ge 1
     artifacts:
       - /tmp/*.ipa
       - /tmp/xcodebuild.log
