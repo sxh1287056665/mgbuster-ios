@@ -175,6 +175,10 @@ workflows:
           PBX="$XCODE_PROJECT/project.pbxproj"
           test -f "$PBX"
           cp "$PBX" "$PBX.orig"
+          # Unity 自带 usymtool 是 x86_64 Mach-O，在 Apple Silicon 上段错误；符号上传非必要，短路
+          printf '#!/bin/sh\nexit 0\n' > /tmp/proj/process_symbols.sh
+          chmod +x /tmp/proj/process_symbols.sh /tmp/proj/MapFileParser.sh
+          cat /tmp/proj/process_symbols.sh
           perl -0pi -e 's/ENABLE_BITCODE = YES/ENABLE_BITCODE = NO/g' "$PBX"
           perl -0pi -e 's/PRODUCT_BUNDLE_IDENTIFIER = "com\.whitepeach\.\$\{PRODUCT_NAME:rfc1123identifier\}";/PRODUCT_BUNDLE_IDENTIFIER = "'"$BUNDLE_ID"'";/g' "$PBX"
           perl -0pi -e 's/PRODUCT_BUNDLE_IDENTIFIER = com\.unity3d\.framework;/PRODUCT_BUNDLE_IDENTIFIER = "'"$BUNDLE_ID"'.framework";/g' "$PBX"
