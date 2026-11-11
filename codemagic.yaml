@@ -44,7 +44,14 @@ workflows:
           chmod +x /tmp/proj/MapFileParser.sh /tmp/proj/process_symbols.sh 2>/dev/null || true
           # base3 的 process_symbols.sh 调用同目录 usymtool（Mach-O 可执行），同样丢执行位
           find /tmp/proj -maxdepth 1 -type f -exec chmod +x {} \;
-          ls -l /tmp/proj | head -25
+          # usymtool 是 2019.2 附带的 x86 Mach-O，在 macOS 15/arm64 上段错误（SIGSEGV 11），
+          # 它只负责把 IL2CPP 符号灌进 dSYM，不参与产物；改 no-op 让构建阶段返回 0
+          if [ -f /tmp/proj/process_symbols.sh ]; then
+            printf '#!/bin/sh\nexit 0\n' > /tmp/proj/process_symbols.sh
+            chmod +x /tmp/proj/process_symbols.sh
+            cat /tmp/proj/process_symbols.sh
+          fi
+          ls -l /tmp/proj > /tmp/top_ls.txt; sed -n '1,25p' /tmp/top_ls.txt
           echo "--- 顶层 ---"
           ls -1 /tmp/proj
           echo "--- 权限 ---"
@@ -146,7 +153,8 @@ workflows:
           ditto -c -k --keepParent "$APP" "/tmp/${APP_NAME}-app.zip"
           ls -lh /tmp/*.ipa /tmp/*.zip
           echo "--- ipa 自检 ---"
-          unzip -l "/tmp/${APP_NAME}-unsigned.ipa" | head -12
+          unzip -l "/tmp/${APP_NAME}-unsigned.ipa" > /tmp/ipa_list.txt
+          sed -n '1,20p' /tmp/ipa_list.txt
 
     artifacts:
       - /tmp/*.ipa
@@ -183,7 +191,14 @@ workflows:
           chmod +x /tmp/proj/MapFileParser.sh /tmp/proj/process_symbols.sh 2>/dev/null || true
           # base3 的 process_symbols.sh 调用同目录 usymtool（Mach-O 可执行），同样丢执行位
           find /tmp/proj -maxdepth 1 -type f -exec chmod +x {} \;
-          ls -l /tmp/proj | head -25
+          # usymtool 是 2019.2 附带的 x86 Mach-O，在 macOS 15/arm64 上段错误（SIGSEGV 11），
+          # 它只负责把 IL2CPP 符号灌进 dSYM，不参与产物；改 no-op 让构建阶段返回 0
+          if [ -f /tmp/proj/process_symbols.sh ]; then
+            printf '#!/bin/sh\nexit 0\n' > /tmp/proj/process_symbols.sh
+            chmod +x /tmp/proj/process_symbols.sh
+            cat /tmp/proj/process_symbols.sh
+          fi
+          ls -l /tmp/proj > /tmp/top_ls.txt; sed -n '1,25p' /tmp/top_ls.txt
           echo "--- 顶层 ---"
           ls -1 /tmp/proj
           echo "--- 权限 ---"
@@ -286,7 +301,8 @@ workflows:
           ditto -c -k --keepParent "$APP" "/tmp/${APP_NAME}-app.zip"
           ls -lh /tmp/*.ipa /tmp/*.zip
           echo "--- ipa 自检 ---"
-          unzip -l "/tmp/${APP_NAME}-unsigned.ipa" | head -12
+          unzip -l "/tmp/${APP_NAME}-unsigned.ipa" > /tmp/ipa_list.txt
+          sed -n '1,20p' /tmp/ipa_list.txt
 
     artifacts:
       - /tmp/*.ipa
