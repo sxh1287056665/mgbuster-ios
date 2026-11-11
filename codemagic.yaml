@@ -8,7 +8,7 @@
 #   用户侧（Windows）  = 全能签 zsign 自签 + 装机（证书不上云）
 #
 # 工程来源：GitHub release 直链（公开仓库，curl 免鉴权）
-# 实例：mac_mini_m2（Apple Silicon，Xcode 15.4）。此路径不需要 Unity，
+# 实例：mac_mini_m2（Apple Silicon，Xcode 16.4 / macOS 15.5）。此路径不需要 Unity，
 #       所以不存在 Intel Unity 在 Apple Silicon + macOS 14 上的兼容问题。
 # ============================================================================
 
@@ -18,7 +18,7 @@ workflows:
     instance_type: mac_mini_m2
     max_build_duration: 120
     environment:
-      xcode: 15.4
+      xcode: 16.4
       vars:
         APP_NAME: Onnanoko6
         XCODE_PROJECT: Unity-iPhone.xcodeproj
@@ -143,7 +143,7 @@ workflows:
     instance_type: mac_mini_m2
     max_build_duration: 120
     environment:
-      xcode: 15.4
+      xcode: 16.4
       vars:
         APP_NAME: KIZUNAPlayer
         XCODE_PROJECT: Unity-iPhone.xcodeproj
