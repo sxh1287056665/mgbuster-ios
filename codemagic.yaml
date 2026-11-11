@@ -42,6 +42,9 @@ workflows:
           # 缺 +x 会导致 PhaseScriptExecution 直接失败（status 65）
           find /tmp/proj -name '*.sh' -print -exec chmod +x {} \;
           chmod +x /tmp/proj/MapFileParser.sh /tmp/proj/process_symbols.sh 2>/dev/null || true
+          # base3 的 process_symbols.sh 调用同目录 usymtool（Mach-O 可执行），同样丢执行位
+          find /tmp/proj -maxdepth 1 -type f -exec chmod +x {} \;
+          ls -l /tmp/proj | head -25
           echo "--- 顶层 ---"
           ls -1 /tmp/proj
           echo "--- 权限 ---"
@@ -60,13 +63,19 @@ workflows:
           perl -0pi -e 's/ARCHS = armv7;/ARCHS = arm64;/g' "$PBX"
           perl -0pi -e 's/"CODE_SIGN_IDENTITY\[sdk=iphoneos\*\]" = "[^"]*";/"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "";/g' "$PBX"
           perl -0pi -e 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]+;/IPHONEOS_DEPLOYMENT_TARGET = 12.0;/g' "$PBX"
+          # armv7 时代的编译开关，arm64 clang 直接报
+          #   clang: error: unsupported option '-mno-thumb' for target 'arm64-apple-ios12.0'
+          perl -0pi -e 's/^[ \t]*"-mno-thumb",\r?\n//gm' "$PBX"
+          perl -0pi -e 's/^[ \t]*GCC_THUMB_SUPPORT = NO;\r?\n//gm' "$PBX"
 
           echo "--- 硬断言 ---"
           test "$(grep -c 'ENABLE_BITCODE = YES' "$PBX" || true)" = "0"
           test "$(grep -c 'ARCHS = armv7;' "$PBX" || true)" = "0"
           test "$(grep -c 'iPhone Developer' "$PBX" || true)" = "0"
+          test "$(grep -c 'mno-thumb' "$PBX" || true)" = "0"
+          test "$(grep -c 'GCC_THUMB_SUPPORT' "$PBX" || true)" = "0"
           test "$(grep -c "PRODUCT_BUNDLE_IDENTIFIER = ${BUNDLE_ID};" "$PBX" || true)" -ge 1
-          echo "bitcode=NO ok  arm64 ok  unsigned ok  bundle=${BUNDLE_ID}"
+          echo "bitcode=NO ok  arm64 ok  unsigned ok  no-thumb ok  bundle=${BUNDLE_ID}"
 
           # Info.plist 必须声明 arm64 + metal，否则真机不装
           PLIST="$XCODE_PROJECT/../Info.plist"
@@ -172,6 +181,9 @@ workflows:
           # 缺 +x 会导致 PhaseScriptExecution 直接失败（status 65）
           find /tmp/proj -name '*.sh' -print -exec chmod +x {} \;
           chmod +x /tmp/proj/MapFileParser.sh /tmp/proj/process_symbols.sh 2>/dev/null || true
+          # base3 的 process_symbols.sh 调用同目录 usymtool（Mach-O 可执行），同样丢执行位
+          find /tmp/proj -maxdepth 1 -type f -exec chmod +x {} \;
+          ls -l /tmp/proj | head -25
           echo "--- 顶层 ---"
           ls -1 /tmp/proj
           echo "--- 权限 ---"
@@ -188,13 +200,19 @@ workflows:
           perl -0pi -e 's/ARCHS = armv7;/ARCHS = arm64;/g' "$PBX"
           perl -0pi -e 's/"CODE_SIGN_IDENTITY\[sdk=iphoneos\*\]" = "[^"]*";/"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "";/g' "$PBX"
           perl -0pi -e 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]+;/IPHONEOS_DEPLOYMENT_TARGET = 12.0;/g' "$PBX"
+          # armv7 时代的编译开关，arm64 clang 直接报
+          #   clang: error: unsupported option '-mno-thumb' for target 'arm64-apple-ios12.0'
+          perl -0pi -e 's/^[ \t]*"-mno-thumb",\r?\n//gm' "$PBX"
+          perl -0pi -e 's/^[ \t]*GCC_THUMB_SUPPORT = NO;\r?\n//gm' "$PBX"
 
           echo "--- 硬断言 ---"
           test "$(grep -c 'ENABLE_BITCODE = YES' "$PBX" || true)" = "0"
           test "$(grep -c 'ARCHS = armv7;' "$PBX" || true)" = "0"
           test "$(grep -c 'iPhone Developer' "$PBX" || true)" = "0"
+          test "$(grep -c 'mno-thumb' "$PBX" || true)" = "0"
+          test "$(grep -c 'GCC_THUMB_SUPPORT' "$PBX" || true)" = "0"
           test "$(grep -c "PRODUCT_BUNDLE_IDENTIFIER = ${BUNDLE_ID};" "$PBX" || true)" -ge 1
-          echo "bitcode=NO ok  arm64 ok  unsigned ok  bundle=${BUNDLE_ID}"
+          echo "bitcode=NO ok  arm64 ok  unsigned ok  no-thumb ok  bundle=${BUNDLE_ID}"
 
           PLIST="Info.plist"
           grep -q '<string>arm64</string>' "$PLIST"
