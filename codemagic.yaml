@@ -38,8 +38,14 @@ workflows:
           unzip -q /tmp/project.zip -d /tmp/proj
           test -d "/tmp/proj/$XCODE_PROJECT"
           test -f "/tmp/proj/$XCODE_PROJECT/project.pbxproj"
+          # zip 不保留可执行位，Unity 的 Run Script 阶段会调用 MapFileParser.sh，
+          # 缺 +x 会导致 PhaseScriptExecution 直接失败（status 65）
+          find /tmp/proj -name '*.sh' -print -exec chmod +x {} \;
+          chmod +x /tmp/proj/MapFileParser.sh /tmp/proj/process_symbols.sh 2>/dev/null || true
           echo "--- 顶层 ---"
           ls -1 /tmp/proj
+          echo "--- 权限 ---"
+          ls -l /tmp/proj/*.sh
           echo "--- 体积 ---"
           du -sh /tmp/proj
 
@@ -162,8 +168,14 @@ workflows:
           unzip -q /tmp/project.zip -d /tmp/proj
           test -d "/tmp/proj/$XCODE_PROJECT"
           test -f "/tmp/proj/$XCODE_PROJECT/project.pbxproj"
+          # zip 不保留可执行位，Unity 的 Run Script 阶段会调用 MapFileParser.sh，
+          # 缺 +x 会导致 PhaseScriptExecution 直接失败（status 65）
+          find /tmp/proj -name '*.sh' -print -exec chmod +x {} \;
+          chmod +x /tmp/proj/MapFileParser.sh /tmp/proj/process_symbols.sh 2>/dev/null || true
           echo "--- 顶层 ---"
           ls -1 /tmp/proj
+          echo "--- 权限 ---"
+          ls -l /tmp/proj/*.sh
           du -sh /tmp/proj
 
       - name: 校验并兜底修补工程
