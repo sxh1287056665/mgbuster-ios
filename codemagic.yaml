@@ -1,210 +1,85 @@
+# ============================================================================
+# APK → iOS 未签名 IPA：Codemagic 主路径（Xcode-only）
+#
+# 分工：
+#   Windows 侧（本机） = Unity 2019.4.18f1 生成 Unity-iPhone.xcodeproj
+#                        并已完成 pbxproj / Info.plist 归一化
+#   Codemagic（macOS） = 只做 xcodebuild + Payload 打包，产出 unsigned IPA
+#   用户侧（Windows）  = 全能签 zsign 自签 + 装机（证书不上云）
+#
+# 工程来源：GitHub release 直链（公开仓库，curl 免鉴权）
+# 实例：mac_mini_m2（Apple Silicon，Xcode 15.4）。此路径不需要 Unity，
+#       所以不存在 Intel Unity 在 Apple Silicon + macOS 14 上的兼容问题。
+# ============================================================================
+
 workflows:
-  ios-link-test:
-    name: SiNiSistar2 iOS app build
-    instance_type: mac_mini_m2
-    max_build_duration: 90
-    environment:
-      xcode: 16.4
-      vars:
-        PAYLOAD_URL: "https://github.com/sxh1287056665/mgbuster-ios/releases/download/unity-ios-linktest/unity-ios-payload.zip"
-    scripts:
-      - name: Fetch payload
-        script: |
-          set -e
-          cd "$CM_BUILD_DIR"
-          echo "--- downloading payload ---"
-          curl -L --retry 3 --retry-delay 5 -o payload.zip "$PAYLOAD_URL"
-          ls -la payload.zip
-          echo "--- unpacking ---"
-          # -o: overwrite without prompting. CI has no stdin, so any prompt
-          #     would be answered "none" and unzip would exit 1.
-          unzip -q -o payload.zip -d .
-          echo "--- tree ---"
-          ls -la
-          du -sh Libraries Frameworks Data 2>/dev/null || true
-
-      - name: Verify GameAssembly.dylib
-        script: |
-          set -e
-          cd "$CM_BUILD_DIR"
-          echo "=== Mach-O header ==="
-          otool -hv Frameworks/GameAssembly.dylib | sed -n '2,3p'
-          echo "=== build version (expect platform IOS) ==="
-          vtool -show-build Frameworks/GameAssembly.dylib || true
-          echo "=== install name (rewritten to @rpath at build time) ==="
-          otool -D Frameworks/GameAssembly.dylib
-          echo "=== exported il2cpp_ symbols (expect 241) ==="
-          nm -gU Frameworks/GameAssembly.dylib | grep -c '_il2cpp_' || echo 0
-
-      - name: Verify engine contract
-        script: |
-          set -e
-          cd "$CM_BUILD_DIR"
-          echo "=== engine undefined il2cpp_ symbols (expect 155) ==="
-          nm -u Libraries/libiPhone-lib.a 2>/dev/null | grep '_il2cpp' | awk '{print $NF}' | sort -u | wc -l || echo 0
-          echo "=== Data/ layout ==="
-          find Data -type f | head -20
-          echo "total: $(find Data -type f | wc -l | tr -d ' ') files, $(du -sh Data | cut -f1)"
-
-      - name: Patch platform check
-        script: |
-          set -e
-          cd "$CM_BUILD_DIR"
-          # The game data is built for StandaloneOSX, and SerializedFile::
-          # ReadMetadata hard-rejects anything that is not kBuildTargetiOS.
-          # NOP the two b.ne guards so the engine takes the "compatible" path.
-          # The script fails loudly if the member or the expected opcode is
-          # not where it is supposed to be, so no output check is needed here.
-          python3 patch_bundle_platform.py Libraries/libiPhone-lib.a --no-backup
-
-      - name: Build app
-        script: |
-          # pipefail is essential: without it a pipeline's status is the last
-          # command's (tail), so a failing build would report success.
-          set -euo pipefail
-          cd "$CM_BUILD_DIR"
-          chmod +x build_ios.sh
-          set +e
-          ./build_ios.sh 2>&1 | tail -200
-          rc=${PIPESTATUS[0]}
-          set -e
-          if [ "$rc" -ne 0 ]; then
-            echo "===================== BUILD FAILED (rc=$rc) ====================="
-            echo "--- compile errors ---"
-            grep -E 'error:' out/build.log 2>/dev/null | head -40 || true
-            echo "--- linker errors ---"
-            grep -iE 'undefined symbol|duplicate symbol|ld: ' out/build.log 2>/dev/null | head -60 || true
-            echo "--- first failing command ---"
-            grep -E '\*\* BUILD FAILED|The following build commands failed' -A4 out/build.log 2>/dev/null | head -24 || true
-            exit 1
-          fi
-          echo "build script reported success"
-
-      - name: Verify audio bootstrap patch
-        script: |
-          set -e
-          cd "$CM_BUILD_DIR"
-          # The patch itself runs inside build_ios.sh, before the ipa is zipped.
-          # Editing the .app afterwards would never reach the artifact, so this
-          # step only confirms the result landed in the packaged binary.
-          APP="out/build/Release-iphoneos/SiNiSistar2.app"
-          python3 patch_audio_proxy.py \
-            "$APP/Frameworks/UnityFramework.framework/UnityFramework" --no-backup \
-            | tee /tmp/audio.txt
-          # A second run must report "already ret"; anything else means the
-          # build-time patch silently missed and the app will crash on launch.
-          grep -q 'already ret' /tmp/audio.txt
-
-      - name: Inspect app
-        script: |
-          set -e
-          cd "$CM_BUILD_DIR"
-          APP="out/build/Release-iphoneos/SiNiSistar2.app"
-          echo "=== bundle tree (depth 2) ==="
-          find "$APP" -maxdepth 2 | head -40
-          echo
-          echo "=== main binary ==="
-          lipo -info "$APP/SiNiSistar2"
-          otool -L "$APP/SiNiSistar2" | head -12
-          echo
-          echo "=== UnityFramework ==="
-          lipo -info "$APP/Frameworks/UnityFramework.framework/UnityFramework"
-          echo "--- load commands referencing GameAssembly ---"
-          otool -L "$APP/Frameworks/UnityFramework.framework/UnityFramework" | grep -i gameassembly || echo "  (none)"
-          echo "--- rpaths ---"
-          otool -l "$APP/Frameworks/UnityFramework.framework/UnityFramework" | grep -A2 LC_RPATH | grep path || true
-          echo
-          echo "=== embedded GameAssembly framework ==="
-          ls -lR "$APP/Frameworks/GameAssembly.framework"
-          otool -D "$APP/Frameworks/GameAssembly.framework/GameAssembly"
-          echo "--- signature ---"
-          codesign -dv "$APP/Frameworks/GameAssembly.framework" 2>&1 | head -8 || true
-          echo
-          echo "=== Info.plist ==="
-          plutil -p "$APP/Info.plist"
-          echo
-          echo "=== size ==="
-          du -sh "$APP"
-          ls -lh out/*.ipa 2>/dev/null || true
-    artifacts:
-      - out/build.log
-      - out/*.ipa
-      - out/build/Release-iphoneos/*.app
-  # ---------------------------------------------------------------
-  # 神之血 (The Blood of Yidhra) —— 未签名 ipa
-  # 工程来源：release asset yidhra-xcode-v2.zip（bsdtar 打包，条目用正斜杠）
-  # 只编译不签名：CODE_SIGNING_ALLOWED=NO，签名由本机 zsign 事后做。
-  # ---------------------------------------------------------------
-  yidhra-unsigned:
-    name: BloodOfYidhra iOS unsigned
+  base2-unsigned:
+    name: Onnanoko6 unsigned IPA
     instance_type: mac_mini_m2
     max_build_duration: 120
     environment:
-      xcode: 16.4
+      xcode: 15.4
       vars:
-        PROJECT_ZIP_URL: "https://github.com/sxh1287056665/mgbuster-ios/releases/download/yidhra-xcode-v1/yidhra-xcode-v2.zip"
+        APP_NAME: Onnanoko6
         XCODE_PROJECT: Unity-iPhone.xcodeproj
         XCODE_SCHEME: Unity-iPhone
-        BUNDLE_ID: com.whitepeach.thebloodofyidhra
-        APP_NAME: BloodOfYidhra
+        BUNDLE_ID: com.port.onnanoko6
+        PROJECT_ZIP_URL: https://github.com/sxh1287056665/mgbuster-ios/releases/download/ios-unsigned-v1/ios-base2.zip
+        EXPECT_UNITY: 2019.4.18f1
     scripts:
-      - name: Fetch Unity Xcode project
+      - name: 拉取 Xcode 工程
         script: |
           set -euo pipefail
           mkdir -p /tmp/proj
-          curl -fL --retry 3 --retry-delay 5 -o /tmp/project.zip "$PROJECT_ZIP_URL"
+          curl -fL --retry 3 --retry-delay 5 --progress-bar \
+            -o /tmp/project.zip "$PROJECT_ZIP_URL"
           ls -l /tmp/project.zip
-          ditto -x -k /tmp/project.zip /tmp/proj
+          # 工程由 Python zipfile 生成（正斜杠路径 + unix 权限位），unzip 即可
+          unzip -q /tmp/project.zip -d /tmp/proj
           test -d "/tmp/proj/$XCODE_PROJECT"
-          ls -1 /tmp/proj | head -30
-          du -sh /tmp/proj/Data /tmp/proj/Libraries 2>/dev/null || true
-          test -f /tmp/proj/Libraries/libil2cpp.a
-          test -f /tmp/proj/Libraries/libiPhone-lib.a
-          test -f /tmp/proj/Data/Managed/Metadata/global-metadata.dat
-          # Windows 打包丢失执行位，这里补回来
-          chmod +x /tmp/proj/*.sh 2>/dev/null || true
-          for f in /tmp/proj/usymtool /tmp/proj/lzma; do if [ -f "$f" ]; then chmod +x "$f"; codesign -f -s - "$f" 2>/dev/null || true; fi; done
-          file /tmp/proj/usymtool /tmp/proj/lzma || true
-          ls -l /tmp/proj/*.sh /tmp/proj/usymtool /tmp/proj/lzma
-          echo "payload ok"
+          test -f "/tmp/proj/$XCODE_PROJECT/project.pbxproj"
+          echo "--- 顶层 ---"
+          ls -1 /tmp/proj
+          echo "--- 体积 ---"
+          du -sh /tmp/proj
 
-      - name: Patch project (bitcode, bundle id, archs)
+      - name: 校验并兜底修补工程
         script: |
           set -euo pipefail
           cd /tmp/proj
           PBX="$XCODE_PROJECT/project.pbxproj"
-          test -f "$PBX"
           cp "$PBX" "$PBX.orig"
-          # Unity 自带 usymtool 是 x86_64 Mach-O，在 Apple Silicon 上段错误；符号上传非必要，短路
-          printf '#!/bin/sh\nexit 0\n' > /tmp/proj/process_symbols.sh
-          chmod +x /tmp/proj/process_symbols.sh /tmp/proj/MapFileParser.sh
-          cat /tmp/proj/process_symbols.sh
+          # 幂等兜底：本机已归一化，这些替换通常 0 命中，只为防回归
           perl -0pi -e 's/ENABLE_BITCODE = YES/ENABLE_BITCODE = NO/g' "$PBX"
-          perl -0pi -e 's/PRODUCT_BUNDLE_IDENTIFIER = "com\.whitepeach\.\$\{PRODUCT_NAME:rfc1123identifier\}";/PRODUCT_BUNDLE_IDENTIFIER = "'"$BUNDLE_ID"'";/g' "$PBX"
-          perl -0pi -e 's/PRODUCT_BUNDLE_IDENTIFIER = com\.unity3d\.framework;/PRODUCT_BUNDLE_IDENTIFIER = "'"$BUNDLE_ID"'.framework";/g' "$PBX"
           perl -0pi -e 's/ARCHS = armv7;/ARCHS = arm64;/g' "$PBX"
-          # armv7 时代参数，arm64 clang 直接报 unsupported option
-          perl -0pi -e 's/[ \t]*"-mno-thumb",\r?\n//g' "$PBX"
-          BIT=$(grep -c 'ENABLE_BITCODE = YES' "$PBX" || true)
-          ARM=$(grep -c 'ARCHS = armv7;' "$PBX" || true)
-          LEFT=$(grep -c 'com.unity3d.framework' "$PBX" || true)
-          THUMB=$(grep -c 'mno-thumb' "$PBX" || true)
-          APPID=$(grep -Ec "^[[:space:]]*PRODUCT_BUNDLE_IDENTIFIER = \"?$BUNDLE_ID\"?;" "$PBX" || true)
-          FWID=$(grep -Ec "^[[:space:]]*PRODUCT_BUNDLE_IDENTIFIER = \"?$BUNDLE_ID\.framework\"?;" "$PBX" || true)
-          echo "after: bitcodeYES=$BIT armv7=$ARM appId=$APPID fwId=$FWID unityFW=$LEFT thumb=$THUMB"
-          test "$BIT" = "0"
-          test "$ARM" = "0"
-          test "$LEFT" = "0"
-          test "$THUMB" = "0"
-          test "$APPID" = "4"
-          test "$FWID" = "4"
-          grep -n 'PRODUCT_BUNDLE_IDENTIFIER\|ENABLE_BITCODE\|ARCHS = ' "$PBX"
+          perl -0pi -e 's/"CODE_SIGN_IDENTITY\[sdk=iphoneos\*\]" = "[^"]*";/"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "";/g' "$PBX"
+          perl -0pi -e 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]+;/IPHONEOS_DEPLOYMENT_TARGET = 12.0;/g' "$PBX"
 
-      - name: Build unsigned app
+          echo "--- 硬断言 ---"
+          test "$(grep -c 'ENABLE_BITCODE = YES' "$PBX" || true)" = "0"
+          test "$(grep -c 'ARCHS = armv7;' "$PBX" || true)" = "0"
+          test "$(grep -c 'iPhone Developer' "$PBX" || true)" = "0"
+          test "$(grep -c "PRODUCT_BUNDLE_IDENTIFIER = ${BUNDLE_ID};" "$PBX" || true)" -ge 1
+          echo "bitcode=NO ok  arm64 ok  unsigned ok  bundle=${BUNDLE_ID}"
+
+          # Info.plist 必须声明 arm64 + metal，否则真机不装
+          PLIST="$XCODE_PROJECT/../Info.plist"
+          [ -f "$PLIST" ] || PLIST="Info.plist"
+          grep -q '<string>arm64</string>' "$PLIST"
+          grep -q '<string>metal</string>' "$PLIST"
+          test "$(grep -c '<string>armv7</string>' "$PLIST" || true)" = "0"
+          echo "Info.plist ok"
+
+          echo "--- Live2D 链接（base3 才有，base2 为 0）---"
+          grep -c 'libLive2DCubismCore' "$PBX" || true
+
+          echo "--- schemes ---"
+          xcodebuild -list -project "$XCODE_PROJECT"
+
+      - name: 编译未签名 .app
         script: |
           set -euo pipefail
           cd /tmp/proj
-          set +e
           xcodebuild \
             -project "$XCODE_PROJECT" \
             -scheme "$XCODE_SCHEME" \
@@ -212,70 +87,178 @@ workflows:
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
             -derivedDataPath /tmp/dd \
-            -jobs 4 \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGN_ENTITLEMENTS="" \
+            DEVELOPMENT_TEAM="" \
             ENABLE_BITCODE=NO \
-            ENABLE_USER_SCRIPT_SANDBOXING=NO \
+            ONLY_ACTIVE_ARCH=NO \
             clean build 2>&1 | tee /tmp/xcodebuild.log | tail -80
-          rc=${PIPESTATUS[0]}
-          set -e
-          if [ "$rc" -ne 0 ]; then
-            echo "================ BUILD FAILED rc=$rc ================"
-            echo "--- error: ---"
-            grep -E 'error:' /tmp/xcodebuild.log | head -40 || true
-            echo "--- script phase / io failures ---"
-            grep -E 'Permission denied|Command PhaseScriptExecution failed|No such file or directory' /tmp/xcodebuild.log | head -20 || true
-            echo "--- compiled units: $(grep -c 'CompileC ' /tmp/xcodebuild.log || true) ---"
-            echo "--- failed commands ---"
-            grep -E '\*\* BUILD FAILED|The following build commands failed' -A8 /tmp/xcodebuild.log | head -60 || true
-            exit 1
-          fi
           grep -q 'BUILD SUCCEEDED' /tmp/xcodebuild.log
-          APP=$(find /tmp/dd/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' -print -quit)
-          test -n "$APP"
+          APP=$(find /tmp/dd/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
           test -d "$APP"
           echo "APP=$APP"
           du -sh "$APP"
-          echo "--- structure check ---"
-          test -f "$APP/Data/Managed/Metadata/global-metadata.dat" && echo "ok global-metadata.dat"
-          test -f "$APP/Data/globalgamemanagers" && echo "ok globalgamemanagers"
-          test -f "$APP/Frameworks/UnityFramework.framework/UnityFramework" && echo "ok UnityFramework"
-          echo "CFBundleExecutable: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
-          echo "CFBundleIdentifier: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
-          du -sh "$APP/Data" "$APP/Frameworks" 2>/dev/null || true
-          ls -la "$APP" | head -30
 
-      - name: Package unsigned ipa
+          echo "--- 产物硬标记 ---"
+          test -f "$APP/Data/Managed/Metadata/global-metadata.dat" && echo "ok global-metadata"
+          test -f "$APP/Data/globalgamemanagers" && echo "ok globalgamemanagers"
+          test -f "$APP/Data/level0" && echo "ok level0"
+          test -d "$APP/Frameworks/UnityFramework.framework" && echo "ok UnityFramework"
+          echo "arch  : $(lipo -archs "$APP/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")")"
+          echo "binary: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
+          echo "bundle: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
+          echo "minOS : $(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist")"
+          echo "caps  : $(/usr/libexec/PlistBuddy -c 'Print :UIRequiredDeviceCapabilities' "$APP/Info.plist")"
+
+      - name: 打包 Payload 未签名 ipa
         script: |
           set -euo pipefail
-          APP=$(find /tmp/dd/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' -print -quit)
-          test -n "$APP"
+          APP=$(find /tmp/dd/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
           WORK=/tmp/ipa
-          rm -rf "$WORK"
-          mkdir -p "$WORK/Payload"
+          rm -rf "$WORK"; mkdir -p "$WORK/Payload"
+          cp -a "$APP" "$WORK/Payload/"
+          # UnityFramework 的 CFBundleIdentifier 必须区别于主 app，否则自签工具会覆盖嵌套签名
+          UF="$WORK/Payload/$(basename "$APP")/Frameworks/UnityFramework.framework"
+          if [ -d "$UF" ]; then
+            /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ${BUNDLE_ID}.framework" "$UF/Info.plist" || true
+            echo "UnityFramework id: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$UF/Info.plist")"
+          fi
+          cd "$WORK"
+          # ASTC 已压缩，deflate 几乎无收益且耗时，用 store
+          zip -0 -qry "/tmp/${APP_NAME}-unsigned.ipa" Payload
+          ditto -c -k --keepParent "$APP" "/tmp/${APP_NAME}-app.zip"
+          ls -lh /tmp/*.ipa /tmp/*.zip
+          echo "--- ipa 自检 ---"
+          unzip -l "/tmp/${APP_NAME}-unsigned.ipa" | head -12
+
+    artifacts:
+      - /tmp/*.ipa
+      - /tmp/*-app.zip
+      - /tmp/xcodebuild.log
+
+  base3-unsigned:
+    name: KIZUNA PLAYER unsigned IPA
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    environment:
+      xcode: 15.4
+      vars:
+        APP_NAME: KIZUNAPlayer
+        XCODE_PROJECT: Unity-iPhone.xcodeproj
+        XCODE_SCHEME: Unity-iPhone
+        BUNDLE_ID: com.port.kizunaplyer
+        PROJECT_ZIP_URL: https://github.com/sxh1287056665/mgbuster-ios/releases/download/ios-unsigned-v1/ios-base3.zip
+        EXPECT_UNITY: 2019.4.18f1
+    scripts:
+      - name: 拉取 Xcode 工程
+        script: |
+          set -euo pipefail
+          mkdir -p /tmp/proj
+          curl -fL --retry 3 --retry-delay 5 --progress-bar \
+            -o /tmp/project.zip "$PROJECT_ZIP_URL"
+          ls -l /tmp/project.zip
+          unzip -q /tmp/project.zip -d /tmp/proj
+          test -d "/tmp/proj/$XCODE_PROJECT"
+          test -f "/tmp/proj/$XCODE_PROJECT/project.pbxproj"
+          echo "--- 顶层 ---"
+          ls -1 /tmp/proj
+          du -sh /tmp/proj
+
+      - name: 校验并兜底修补工程
+        script: |
+          set -euo pipefail
+          cd /tmp/proj
+          PBX="$XCODE_PROJECT/project.pbxproj"
+          cp "$PBX" "$PBX.orig"
+          perl -0pi -e 's/ENABLE_BITCODE = YES/ENABLE_BITCODE = NO/g' "$PBX"
+          perl -0pi -e 's/ARCHS = armv7;/ARCHS = arm64;/g' "$PBX"
+          perl -0pi -e 's/"CODE_SIGN_IDENTITY\[sdk=iphoneos\*\]" = "[^"]*";/"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "";/g' "$PBX"
+          perl -0pi -e 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]+;/IPHONEOS_DEPLOYMENT_TARGET = 12.0;/g' "$PBX"
+
+          echo "--- 硬断言 ---"
+          test "$(grep -c 'ENABLE_BITCODE = YES' "$PBX" || true)" = "0"
+          test "$(grep -c 'ARCHS = armv7;' "$PBX" || true)" = "0"
+          test "$(grep -c 'iPhone Developer' "$PBX" || true)" = "0"
+          test "$(grep -c "PRODUCT_BUNDLE_IDENTIFIER = ${BUNDLE_ID};" "$PBX" || true)" -ge 1
+          echo "bitcode=NO ok  arm64 ok  unsigned ok  bundle=${BUNDLE_ID}"
+
+          PLIST="Info.plist"
+          grep -q '<string>arm64</string>' "$PLIST"
+          grep -q '<string>metal</string>' "$PLIST"
+          test "$(grep -c '<string>armv7</string>' "$PLIST" || true)" = "0"
+          echo "Info.plist ok"
+
+          echo "--- Live2D 链接（关键）---"
+          test "$(grep -c 'libLive2DCubismCore' "$PBX")" -ge 3
+          test -f "Libraries/Plugins/iOS/libLive2DCubismCore.a"
+          test -f "Libraries/Plugins/iOS/Live2DCubismCoreForceLink.mm"
+          echo "Live2D ok"
+
+          echo "--- schemes ---"
+          xcodebuild -list -project "$XCODE_PROJECT"
+
+      - name: 编译未签名 .app
+        script: |
+          set -euo pipefail
+          cd /tmp/proj
+          xcodebuild \
+            -project "$XCODE_PROJECT" \
+            -scheme "$XCODE_SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath /tmp/dd \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            DEVELOPMENT_TEAM="" \
+            ENABLE_BITCODE=NO \
+            ONLY_ACTIVE_ARCH=NO \
+            clean build 2>&1 | tee /tmp/xcodebuild.log | tail -80
+          grep -q 'BUILD SUCCEEDED' /tmp/xcodebuild.log
+          APP=$(find /tmp/dd/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          test -d "$APP"
+          echo "APP=$APP"
+          du -sh "$APP"
+
+          echo "--- 产物硬标记 ---"
+          test -f "$APP/Data/Managed/Metadata/global-metadata.dat" && echo "ok global-metadata"
+          test -f "$APP/Data/globalgamemanagers" && echo "ok globalgamemanagers"
+          test -f "$APP/Data/level0" && echo "ok level0"
+          test -d "$APP/Frameworks/UnityFramework.framework" && echo "ok UnityFramework"
+          echo "arch  : $(lipo -archs "$APP/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")")"
+          echo "bundle: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
+          echo "minOS : $(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist")"
+
+          echo "--- Live2D 符号落盘（防 dead-strip）---"
+          FW="$APP/Frameworks/UnityFramework.framework/UnityFramework"
+          N=$(nm -gU "$FW" 2>/dev/null | grep -c '_csm' || true)
+          echo "csm symbols: $N"
+          test "$N" -ge 20
+
+      - name: 打包 Payload 未签名 ipa
+        script: |
+          set -euo pipefail
+          APP=$(find /tmp/dd/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          WORK=/tmp/ipa
+          rm -rf "$WORK"; mkdir -p "$WORK/Payload"
           cp -a "$APP" "$WORK/Payload/"
           UF="$WORK/Payload/$(basename "$APP")/Frameworks/UnityFramework.framework"
           if [ -d "$UF" ]; then
-            /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ${BUNDLE_ID}.framework" "$UF/Info.plist"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ${BUNDLE_ID}.framework" "$UF/Info.plist" || true
             echo "UnityFramework id: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$UF/Info.plist")"
           fi
           cd "$WORK"
           zip -0 -qry "/tmp/${APP_NAME}-unsigned.ipa" Payload
-          ls -lh /tmp/*.ipa
-          unzip -l "/tmp/${APP_NAME}-unsigned.ipa" > /tmp/ipa_list.txt 2>&1 || true
-          sed -n '1,8p' /tmp/ipa_list.txt
-          ENTRIES=$(grep -c 'Payload/' /tmp/ipa_list.txt || true)
-          NFC=$(grep -c 'Info.plist' /tmp/ipa_list.txt || true)
-          META=$(grep -c 'global-metadata.dat' /tmp/ipa_list.txt || true)
-          FW=$(grep -c 'UnityFramework.framework/UnityFramework' /tmp/ipa_list.txt || true)
-          echo "ipa entries=$ENTRIES infoPlists=$NFC metadata=$META unityFw=$FW"
-          test "$ENTRIES" -gt 50
-          test "$NFC" -ge 2
-          test "$META" -ge 1
-          test "$FW" -ge 1
+          ditto -c -k --keepParent "$APP" "/tmp/${APP_NAME}-app.zip"
+          ls -lh /tmp/*.ipa /tmp/*.zip
+          echo "--- ipa 自检 ---"
+          unzip -l "/tmp/${APP_NAME}-unsigned.ipa" | head -12
+
     artifacts:
       - /tmp/*.ipa
+      - /tmp/*-app.zip
       - /tmp/xcodebuild.log
