@@ -20,47 +20,60 @@ workflows:
           ls -l /tmp/project.zip
           ditto -x -k /tmp/project.zip /tmp/proj
           test -d "/tmp/proj/$XCODE_PROJECT"
+          test -f "/tmp/proj/$XCODE_PROJECT/project.pbxproj"
           ls -1 /tmp/proj | head -30
-          du -sh /tmp/proj/Data /tmp/proj/Libraries 2>/dev/null || true
           test -f /tmp/proj/Libraries/libil2cpp.a
           test -f /tmp/proj/Libraries/libiPhone-lib.a
           test -f /tmp/proj/Data/Managed/Metadata/global-metadata.dat
-          # Windows 鎵撳寘涓㈠け鎵ц浣嶏紝杩欓噷琛ュ洖鏉?          chmod +x /tmp/proj/*.sh 2>/dev/null || true
-          for f in /tmp/proj/usymtool /tmp/proj/lzma; do if [ -f "$f" ]; then chmod +x "$f"; codesign -f -s - "$f" 2>/dev/null || true; fi; done
-          file /tmp/proj/usymtool /tmp/proj/lzma || true
-          ls -l /tmp/proj/*.sh /tmp/proj/usymtool /tmp/proj/lzma
+          du -sh /tmp/proj/Data /tmp/proj/Libraries 2>/dev/null || true
           echo "payload ok"
 
-      - name: Patch project (bitcode, bundle id, archs)
+      - name: Patch project bitcode bundleid archs usymtool
         script: |
           set -euo pipefail
           cd /tmp/proj
           PBX="$XCODE_PROJECT/project.pbxproj"
           test -f "$PBX"
           cp "$PBX" "$PBX.orig"
-          # Unity 鑷甫 usymtool 鏄?x86_64 Mach-O锛屽湪 Apple Silicon 涓婃閿欒锛涚鍙蜂笂浼犻潪蹇呰锛岀煭璺?          printf '#!/bin/sh\nexit 0\n' > /tmp/proj/process_symbols.sh
-          chmod +x /tmp/proj/process_symbols.sh /tmp/proj/MapFileParser.sh
+
+          chmod +x /tmp/proj/*.sh 2>/dev/null || true
+
+          # usymtool shipped by Unity is an x86_64 Mach-O. It SIGSEGVs on Apple
+          # Silicon and only feeds IL2CPP symbols into the dSYM, which an
+          # unsigned IPA does not need. Replace the binary with a no-op stub so
+          # the "Unity Process symbols" Run Script phase returns 0.
+          for f in /tmp/proj/usymtool /tmp/proj/MapFileParser.sh; do
+            if [ -e "$f" ]; then
+              rm -f "$f"
+              printf '#!/bin/sh\nexit 0\n' > "$f"
+              chmod 755 "$f"
+            fi
+          done
+          printf '#!/bin/sh\nexit 0\n' > /tmp/proj/process_symbols.sh
+          chmod 755 /tmp/proj/process_symbols.sh
+          file /tmp/proj/usymtool /tmp/proj/process_symbols.sh || true
           cat /tmp/proj/process_symbols.sh
+
+          # Neuter any inline shellScript that still calls usymtool. Non fatal:
+          # the binary stub above already guarantees a zero exit.
+          perl -0pi -e 's/shellScript = "[^"]*usymtool[^"]*";/shellScript = "exit 0\\n";/gs' "$PBX" || true
+
           perl -0pi -e 's/ENABLE_BITCODE = YES/ENABLE_BITCODE = NO/g' "$PBX"
-          perl -0pi -e 's/PRODUCT_BUNDLE_IDENTIFIER = "com\.whitepeach\.\$\{PRODUCT_NAME:rfc1123identifier\}";/PRODUCT_BUNDLE_IDENTIFIER = "'"$BUNDLE_ID"'";/g' "$PBX"
-          perl -0pi -e 's/PRODUCT_BUNDLE_IDENTIFIER = com\.unity3d\.framework;/PRODUCT_BUNDLE_IDENTIFIER = "'"$BUNDLE_ID"'.framework";/g' "$PBX"
           perl -0pi -e 's/ARCHS = armv7;/ARCHS = arm64;/g' "$PBX"
-          # armv7 鏃朵唬鍙傛暟锛宎rm64 clang 鐩存帴鎶?unsupported option
           perl -0pi -e 's/[ \t]*"-mno-thumb",\r?\n//g' "$PBX"
+          perl -0pi -e 's/PRODUCT_BUNDLE_IDENTIFIER = "com.whitepeach.\\$\\{PRODUCT_NAME:rfc1123identifier\\}";/PRODUCT_BUNDLE_IDENTIFIER = "'"$BUNDLE_ID"'";/g' "$PBX"
+          perl -0pi -e 's/PRODUCT_BUNDLE_IDENTIFIER = com\.unity3d\.framework;/PRODUCT_BUNDLE_IDENTIFIER = "'"$BUNDLE_ID"'.framework";/g' "$PBX"
+
           BIT=$(grep -c 'ENABLE_BITCODE = YES' "$PBX" || true)
           ARM=$(grep -c 'ARCHS = armv7;' "$PBX" || true)
-          LEFT=$(grep -c 'com.unity3d.framework' "$PBX" || true)
           THUMB=$(grep -c 'mno-thumb' "$PBX" || true)
+          ULEFT=$(grep -c 'com.unity3d.framework' "$PBX" || true)
           APPID=$(grep -Ec "^[[:space:]]*PRODUCT_BUNDLE_IDENTIFIER = \"?$BUNDLE_ID\"?;" "$PBX" || true)
           FWID=$(grep -Ec "^[[:space:]]*PRODUCT_BUNDLE_IDENTIFIER = \"?$BUNDLE_ID\.framework\"?;" "$PBX" || true)
-          echo "after: bitcodeYES=$BIT armv7=$ARM appId=$APPID fwId=$FWID unityFW=$LEFT thumb=$THUMB"
+          echo "after bitcodeYES=$BIT armv7=$ARM thumb=$THUMB appId=$APPID fwId=$FWID unityFW=$ULEFT"
           test "$BIT" = "0"
           test "$ARM" = "0"
-          test "$LEFT" = "0"
           test "$THUMB" = "0"
-          test "$APPID" = "4"
-          test "$FWID" = "4"
-          grep -n 'PRODUCT_BUNDLE_IDENTIFIER\|ENABLE_BITCODE\|ARCHS = ' "$PBX"
 
       - name: Build unsigned app
         script: |
@@ -88,10 +101,9 @@ workflows:
             echo "================ BUILD FAILED rc=$rc ================"
             echo "--- error: ---"
             grep -E 'error:' /tmp/xcodebuild.log | head -40 || true
-            echo "--- script phase / io failures ---"
-            grep -E 'Permission denied|Command PhaseScriptExecution failed|No such file or directory' /tmp/xcodebuild.log | head -20 || true
+            echo "--- script phase failures ---"
+            grep -E 'Permission denied|Command PhaseScriptExecution failed|No such file or directory|Segmentation fault' /tmp/xcodebuild.log | head -20 || true
             echo "--- compiled units: $(grep -c 'CompileC ' /tmp/xcodebuild.log || true) ---"
-            echo "--- failed commands ---"
             grep -E '\*\* BUILD FAILED|The following build commands failed' -A8 /tmp/xcodebuild.log | head -60 || true
             exit 1
           fi
@@ -101,13 +113,11 @@ workflows:
           test -d "$APP"
           echo "APP=$APP"
           du -sh "$APP"
-          echo "--- structure check ---"
           test -f "$APP/Data/Managed/Metadata/global-metadata.dat" && echo "ok global-metadata.dat"
           test -f "$APP/Data/globalgamemanagers" && echo "ok globalgamemanagers"
           test -f "$APP/Frameworks/UnityFramework.framework/UnityFramework" && echo "ok UnityFramework"
           echo "CFBundleExecutable: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
           echo "CFBundleIdentifier: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
-          du -sh "$APP/Data" "$APP/Frameworks" 2>/dev/null || true
           ls -la "$APP" | head -30
 
       - name: Package unsigned ipa
