@@ -229,6 +229,9 @@ static void install_startunity_hook(void)
 // may not be registered yet when this constructor runs, in which case the
 // swizzle above quietly does nothing. The app only becomes active after Unity
 // has launched, so this fires slightly later but never misses.
+static void gb_gc_rescan(void);
+static void gb_gc_discover(void);
+
 static void on_did_become_active(NSNotification *note)
 {
     (void)note;
@@ -236,6 +239,11 @@ static void on_did_become_active(NSNotification *note)
         fprintf(stderr, TAG "applicationDidBecomeActive - runtime usable\n");
         g_il2cpp_ready = 1;
     }
+    // The ctor runs before UIApplicationMain, where the GameController XPC
+    // session does not exist yet, so the first real chance to see a pad that
+    // was already paired is here.
+    gb_gc_rescan();
+    gb_gc_discover();
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -2390,15 +2398,65 @@ static void gbpad_install_overlay(int attempt)
 // --- physical controller ---------------------------------------------------
 // The iOS InputSystem backend is absent from this binary, so nothing hands us a
 // Gamepad. Read GameController ourselves and feed the same virtual device.
-
+//
 // Everything below talks to the controller through the ObjC runtime, so there
 // is no compile-time dependency on GameController headers or the framework.
-// Every call below is guarded. On iOS the extendedGamepad profile does not
-// always carry every element - leftThumbstickButton is missing on several
-// MFi pads - and an unguarded objc_msgSend on a nil element raises, which
-// tears down the whole valueChangedHandler block. The first exception made
-// every later press invisible, which is why the pad "connected but did
-// nothing".
+//
+// Three defects made a physical pad look "connected but dead":
+//
+//   * the notification names were registered as
+//     @"GCControllerDidConnectNotification", but Apple's notification *name*
+//     strings are the header identifiers minus the suffix:
+//         GCControllerDidConnectNotification    -> @"GCControllerDidConnect"
+//     so neither observer ever fired. Both spellings are registered now.
+//   * [GCController controllers] was read exactly once, from the dlopen
+//     constructor that runs inside main() before UIApplicationMain. The
+//     GameController XPC session does not exist that early, so the list came
+//     back empty and a pad that was already paired at launch was never
+//     attached -- the common case, since players pair first and launch second.
+//   * nothing re-enumerated later. There is now a foreground rescan plus a
+//     bounded polling fallback.
+//
+// A pad that is attached gets its valueChangedHandler installed once, tracked
+// through an associated object, so the three paths (ctor, notification,
+// polling) cannot install handlers on top of each other.
+
+static int   g_gcReady     = 0;     // framework mapped, GCController resolved
+static int   g_gcObservers = 0;
+static int   g_gcDiscovery = 0;
+static int   g_gcAttached  = 0;
+static Class g_gcClass     = Nil;
+static char  g_gcMark;              // associated-object key: controller handled
+
+static void gb_gc_rescan(void);
+static void gb_gc_discover(void);
+static void gb_gc_retry(int attempt);
+
+static int gb_gc_ensure(void)
+{
+    if (g_gcReady) return 1;
+
+    Class gc = objc_getClass("GCController");
+    if (!gc) {
+        void *h = dlopen("/System/Library/Frameworks/GameController.framework/GameController",
+                         RTLD_NOW);
+        if (!h) {
+            fprintf(stderr, TAG "gc: framework dlopen failed: %s\n", dlerror());
+            return 0;
+        }
+        fprintf(stderr, TAG "gc: framework dlopen -> ok\n");
+        gc = objc_getClass("GCController");
+    }
+    if (!gc) {
+        fprintf(stderr, TAG "gc: GCController class still nil after dlopen\n");
+        return 0;
+    }
+    g_gcClass = gc;
+    g_gcReady = 1;
+    fprintf(stderr, TAG "gc: GCController ready\n");
+    return 1;
+}
+
 static id gb_elem(id pad, const char *name)
 {
     if (!pad) return nil;
@@ -2427,126 +2485,178 @@ static float gb_axis(id owner, const char *stickName, const char *axisName)
     return ((float (*)(id, SEL))objc_msgSend)(a, v);
 }
 
-static void gbpad_install_gamecontroller(void)
+static void gb_gc_attach(id c)
 {
-    // No link-time dependency: pull the framework in on demand. iOS does not
-    // load GameController by default, so objc_getClass returns nil until it is
-    // mapped - and adding -framework GameController would tie the build to the
-    // SDK having that framework present.
-    Class gc = objc_getClass("GCController");
-    if (!gc) {
-        void *h = dlopen("/System/Library/Frameworks/GameController.framework/GameController",
-                         RTLD_NOW);
-        fprintf(stderr, TAG "GameController dlopen -> %s\n", h ? "ok" : dlerror());
-        gc = objc_getClass("GCController");
-    }
-    if (!gc) {
-        fprintf(stderr, TAG "GCController unavailable, physical pads disabled\n");
+    if (!c) return;
+    if (objc_getAssociatedObject(c, &g_gcMark)) return;   // already handled
+
+    // extendedGamepad -> gamepad -> microGamepad. Several MFi pads only expose
+    // the basic profile, and the Siri remote only the micro one.
+    id g = gb_elem(c, "extendedGamepad");
+    const char *profile = "extended";
+    if (!g) { g = gb_elem(c, "gamepad");      profile = "basic"; }
+    if (!g) { g = gb_elem(c, "microGamepad"); profile = "micro"; }
+    if (!g) {
+        fprintf(stderr, TAG "gc: controller has no gamepad profile\n");
         return;
     }
 
-    void (^attach)(id) = ^(id c) {
-        if (!c) return;
-        id g = gb_elem(c, "extendedGamepad");
-        if (!g) g = gb_elem(c, "gamepad");   // basic profile still has A/B/Start
-        if (!g) {
-            fprintf(stderr, TAG "controller connected but has no gamepad profile\n");
-            return;
-        }
-        fprintf(stderr, TAG "controller attached, profile=%s\n",
-                (gb_elem(c, "extendedGamepad") ? "extended" : "basic"));
-
-        // Feed the same virtual device the overlay writes to, so the game only
-        // ever sees one input source.
-        void (^handler)(id, id) = ^(id pad, id element) {
-            (void)element;
-            @try {
-                unsigned m = 0;
-                if (gb_pressed(pad, "buttonA"))     m |= 1u << GB_SOUTH;
-                if (gb_pressed(pad, "buttonB"))     m |= 1u << GB_EAST;
-                if (gb_pressed(pad, "buttonX"))     m |= 1u << GB_WEST;
-                if (gb_pressed(pad, "buttonY"))     m |= 1u << GB_NORTH;
-                if (gb_pressed(pad, "leftShoulder"))  m |= 1u << GB_LB;
-                if (gb_pressed(pad, "rightShoulder")) m |= 1u << GB_RB;
-                if (gb_pressed(pad, "buttonMenu"))  m |= 1u << GB_START;
-                if (gb_pressed(pad, "buttonOptions")) m |= 1u << GB_SELECT;
-                if (gb_pressed(pad, "dpadUp"))      m |= 1u << GB_DUP;
-                if (gb_pressed(pad, "dpadDown"))    m |= 1u << GB_DDOWN;
-                if (gb_pressed(pad, "dpadLeft"))    m |= 1u << GB_DLEFT;
-                if (gb_pressed(pad, "dpadRight"))   m |= 1u << GB_DRIGHT;
-                if (gb_pressed(pad, "leftTrigger")) m |= 1u << GB_LT;
-                if (gb_pressed(pad, "rightTrigger")) m |= 1u << GB_RT;
-                if (gb_pressed(pad, "leftThumbstickButton"))  m |= 1u << GB_LSTICK;
-                if (gb_pressed(pad, "rightThumbstickButton")) m |= 1u << GB_RSTICK;
-                g_gbHeldPad = m;
-
-                float x = gb_axis(pad, "leftThumbstick", "xAxis");
-                float y = gb_axis(pad, "leftThumbstick", "yAxis");
-                float dx = gb_axis(pad, "dpad", "xAxis");
-                float dy = gb_axis(pad, "dpad", "yAxis");
-                if (fabsf(dx) > 0.5f) x = dx;
-                if (fabsf(dy) > 0.5f) y = dy;
-                if (fabsf(x) < 0.14f) x = 0.0f;
-                if (fabsf(y) < 0.14f) y = 0.0f;
-                g_gbStickPad[0] = x;
-                g_gbStickPad[1] = y;
-                g_gbPadStick = (x != 0.0f || y != 0.0f) ? 1 : 0;
-            } @catch (NSException *ex) {
-                fprintf(stderr, TAG "gamepad handler threw: %s\n",
-                        [[ex reason] UTF8String]);
-                g_gbHeldPad = 0;
-                g_gbStickPad[0] = g_gbStickPad[1] = 0.0f;
-                g_gbPadStick = 0;
-            }
-        };
-
-        SEL setQueue = sel_registerName("setHandlerQueue:");
-        if ([c respondsToSelector:setQueue])
-            ((void (*)(id, SEL, id))objc_msgSend)(c, setQueue, dispatch_get_main_queue());
-
-        SEL setH = sel_registerName("setValueChangedHandler:");
-        if (![g respondsToSelector:setH]) {
-            fprintf(stderr, TAG "profile has no setValueChangedHandler\n");
-            return;
-        }
-        // The profile's handler has to be copied onto the heap: the block
-        // above is stack-allocated and GameController keeps it well past this
-        // function. Without the copy the handler ran once and turned to junk.
-        id blk = [handler copy];
-        ((void (*)(id, SEL, id))objc_msgSend)(g, setH, blk);
-        fprintf(stderr, TAG "extended gamepad valueChangedHandler installed\n");
-    };
-
-    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-    [nc addObserverForName:@"GCControllerDidConnectNotification"
-                    object:nil queue:[NSOperationQueue mainQueue]
-                usingBlock:^(NSNotification *n) {
-                    fprintf(stderr, TAG "GCControllerDidConnect\n");
-                    attach(n.object);
-                }];
-    [nc addObserverForName:@"GCControllerDidDisconnectNotification"
-                    object:nil queue:[NSOperationQueue mainQueue]
-                usingBlock:^(NSNotification *n) {
-                    (void)n;
-                    g_gbHeldPad = 0;
-                    g_gbStickPad[0] = g_gbStickPad[1] = 0.0f;
-                    g_gbPadStick = 0;
-                    fprintf(stderr, TAG "controller disconnected\n");
-                }];
-
-    SEL selControllers = sel_registerName("controllers");
-    if ([(id)gc respondsToSelector:selControllers]) {
-        id existing = ((id (*)(id, SEL))objc_msgSend)((id)gc, selControllers);
-        if (existing) {
-            for (id c in (NSArray *)existing) attach(c);
-        }
+    SEL setH = sel_registerName("setValueChangedHandler:");
+    if (![g respondsToSelector:setH]) {
+        fprintf(stderr, TAG "gc: profile has no setValueChangedHandler\n");
+        return;
     }
 
-    SEL selDiscover = sel_registerName(
-        "startWirelessControllerDiscoveryWithCompletionHandler:");
-    if ([(id)gc respondsToSelector:selDiscover])
-        ((void (*)(id, SEL, id))objc_msgSend)((id)gc, selDiscover, nil);
-    fprintf(stderr, TAG "wireless controller discovery started\n");
+    // Feed the same virtual device the overlay writes to, so the game only ever
+    // sees one input source. Every element access is guarded: an unguarded
+    // objc_msgSend on a nil element raises and tears the handler down for good,
+    // which is what made the pad go permanently dead after the first press.
+    void (^handler)(id, id) = ^(id pad, id element) {
+        (void)element;
+        @try {
+            unsigned m = 0;
+            if (gb_pressed(pad, "buttonA"))     m |= 1u << GB_SOUTH;
+            if (gb_pressed(pad, "buttonB"))     m |= 1u << GB_EAST;
+            if (gb_pressed(pad, "buttonX"))     m |= 1u << GB_WEST;
+            if (gb_pressed(pad, "buttonY"))     m |= 1u << GB_NORTH;
+            if (gb_pressed(pad, "leftShoulder"))  m |= 1u << GB_LB;
+            if (gb_pressed(pad, "rightShoulder")) m |= 1u << GB_RB;
+            if (gb_pressed(pad, "buttonMenu"))    m |= 1u << GB_START;
+            if (gb_pressed(pad, "buttonOptions")) m |= 1u << GB_SELECT;
+            if (gb_pressed(pad, "dpadUp"))        m |= 1u << GB_DUP;
+            if (gb_pressed(pad, "dpadDown"))      m |= 1u << GB_DDOWN;
+            if (gb_pressed(pad, "dpadLeft"))      m |= 1u << GB_DLEFT;
+            if (gb_pressed(pad, "dpadRight"))     m |= 1u << GB_DRIGHT;
+            if (gb_pressed(pad, "leftTrigger"))   m |= 1u << GB_LT;
+            if (gb_pressed(pad, "rightTrigger"))  m |= 1u << GB_RT;
+            if (gb_pressed(pad, "leftThumbstickButton"))  m |= 1u << GB_LSTICK;
+            if (gb_pressed(pad, "rightThumbstickButton")) m |= 1u << GB_RSTICK;
+            g_gbHeldPad = m;
+
+            float x = gb_axis(pad, "leftThumbstick", "xAxis");
+            float y = gb_axis(pad, "leftThumbstick", "yAxis");
+            float dx = gb_axis(pad, "dpad", "xAxis");
+            float dy = gb_axis(pad, "dpad", "yAxis");
+            if (fabsf(dx) > 0.5f) x = dx;
+            if (fabsf(dy) > 0.5f) y = dy;
+            if (fabsf(x) < 0.14f) x = 0.0f;
+            if (fabsf(y) < 0.14f) y = 0.0f;
+            g_gbStickPad[0] = x;
+            g_gbStickPad[1] = y;
+            g_gbPadStick = (x != 0.0f || y != 0.0f) ? 1 : 0;
+        } @catch (NSException *ex) {
+            fprintf(stderr, TAG "gc: handler threw: %s\n",
+                    [[ex reason] UTF8String]);
+            g_gbHeldPad = 0;
+            g_gbStickPad[0] = g_gbStickPad[1] = 0.0f;
+            g_gbPadStick = 0;
+        }
+    };
+
+    // Callbacks on the main queue: g_gbHeldPad is read from the display link on
+    // the main thread and nothing else is allowed to write it.
+    SEL setQueue = sel_registerName("setHandlerQueue:");
+    if ([c respondsToSelector:setQueue])
+        ((void (*)(id, SEL, id))objc_msgSend)(c, setQueue, dispatch_get_main_queue());
+
+    // The handler has to be copied onto the heap: the block above is stack
+    // allocated and GameController keeps it well past this function.
+    ((void (*)(id, SEL, id))objc_msgSend)(g, setH, [handler copy]);
+
+    objc_setAssociatedObject(c, &g_gcMark, @1, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    g_gcAttached++;
+    int vendor = 0;
+    id vn = gb_elem(c, "vendorName");
+    if (vn) vendor = 1;
+    fprintf(stderr, TAG "gc: attached #%d profile=%s vendor=%s\n",
+            g_gcAttached, profile, vendor ? [[vn description] UTF8String] : "?");
+}
+
+static void gb_gc_rescan(void)
+{
+    if (!gb_gc_ensure()) return;
+
+    SEL selControllers = sel_registerName("controllers");
+    if (![(id)g_gcClass respondsToSelector:selControllers]) {
+        fprintf(stderr, TAG "gc: +controllers unavailable\n");
+        return;
+    }
+    id arr = ((id (*)(id, SEL))objc_msgSend)((id)g_gcClass, selControllers);
+    NSUInteger n = arr ? [(NSArray *)arr count] : 0;
+    fprintf(stderr, TAG "gc: scan controllers=%lu attached=%d\n",
+            (unsigned long)n, g_gcAttached);
+    for (id c in (NSArray *)arr) gb_gc_attach(c);
+}
+
+static void gb_gc_discover(void)
+{
+    if (g_gcDiscovery || !gb_gc_ensure()) return;
+    g_gcDiscovery = 1;
+    SEL s = sel_registerName("startWirelessControllerDiscoveryWithCompletionHandler:");
+    if ([(id)g_gcClass respondsToSelector:s]) {
+        ((void (*)(id, SEL, id))objc_msgSend)((id)g_gcClass, s, nil);
+        fprintf(stderr, TAG "gc: wireless discovery started\n");
+    } else {
+        fprintf(stderr, TAG "gc: no startWirelessControllerDiscovery, skipped\n");
+    }
+}
+
+// Bounded polling. Covers the case where the pad connects after the ctor but no
+// notification arrives (wrong name in a future SDK, or a pad that only shows up
+// once the app is foreground). 20 attempts at 1.5 s = the first 30 s.
+static void gb_gc_retry(int attempt)
+{
+    if (attempt > 20) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        gb_gc_rescan();
+        gb_gc_retry(attempt + 1);
+    });
+}
+
+static void gbpad_install_gamecontroller(void)
+{
+    if (!gb_gc_ensure()) {
+        // Too early to matter: the foreground hook retries later.
+        fprintf(stderr, TAG "gc: deferred to first foreground\n");
+        return;
+    }
+
+    if (!g_gcObservers) {
+        g_gcObservers = 1;
+        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+
+        void (^onConnect)(NSNotification *) = ^(NSNotification *n) {
+            fprintf(stderr, TAG "gc: connect notification\n");
+            gb_gc_attach(n.object);
+        };
+        void (^onDisconnect)(NSNotification *) = ^(NSNotification *n) {
+            (void)n;
+            g_gbHeldPad = 0;
+            g_gbStickPad[0] = g_gbStickPad[1] = 0.0f;
+            g_gbPadStick = 0;
+            fprintf(stderr, TAG "gc: disconnect notification\n");
+        };
+
+        // Both spellings: the value of GCControllerDidConnectNotification is
+        // @"GCControllerDidConnect", but registering the identifier spelling as
+        // well costs nothing and survives a naming surprise.
+        NSArray *connectNames = @[@"GCControllerDidConnect",
+                                  @"GCControllerDidConnectNotification"];
+        NSArray *goneNames    = @[@"GCControllerDidDisconnect",
+                                  @"GCControllerDidDisconnectNotification"];
+        for (NSString *name in connectNames)
+            [nc addObserverForName:name object:nil queue:[NSOperationQueue mainQueue]
+                        usingBlock:onConnect];
+        for (NSString *name in goneNames)
+            [nc addObserverForName:name object:nil queue:[NSOperationQueue mainQueue]
+                        usingBlock:onDisconnect];
+        fprintf(stderr, TAG "gc: observers installed (%lu connect, %lu disconnect)\n",
+                (unsigned long)[connectNames count], (unsigned long)[goneNames count]);
+    }
+
+    gb_gc_rescan();
+    gb_gc_retry(0);
 }
 
 // --- bootstrap -------------------------------------------------------------
