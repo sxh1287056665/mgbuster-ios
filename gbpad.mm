@@ -87,6 +87,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <mach/mach.h>
+#include <mach/task_info.h>
+#include <time.h>
 
 #define TAG "[gbpad] "
 
@@ -231,6 +234,12 @@ static void install_startunity_hook(void)
 // has launched, so this fires slightly later but never misses.
 static void gb_gc_rescan(void);
 static void gb_gc_discover(void);
+// memory budget: the watchdog owns a main-queue timer, the other two are
+// called from notification handlers and from the tick itself.
+static void gb_mem_start(void);
+static void gb_mem_tick(void);
+static void gb_apply_budget(void);
+static void gb_purge(const char *why);
 
 static void on_did_become_active(NSNotification *note)
 {
@@ -244,6 +253,11 @@ static void on_did_become_active(NSNotification *note)
     // was already paired is here.
     gb_gc_rescan();
     gb_gc_discover();
+    // Primary start is the worker right after bind_api (~1 s). This is only
+    // the fallback for a run where stage 1 never resolves; gb_mem_start is
+    // idempotent, and 5 s is well past the point the runtime is usable.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5ull * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{ gb_mem_start(); });
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -2778,6 +2792,223 @@ static void gbpad_install_gamecontroller(void)
     gb_gc_retry(0);
 }
 
+// =============================================================================
+// MEMORY BUDGET
+//
+// The failure this section exists for, measured on device: eight lines of
+// applicationDidReceiveMemoryWarning() inside seven minutes, then the process
+// vanished mid scene load with no signal dump and no managed exception. That is
+// a jetsam kill, not a fault in the port.
+//
+// The engine here is a raw OSX player build. Metal on an A12 cannot sample DXT1,
+// DXT5 or BC7, so every one of those textures goes through libgbpad's decoder
+// and is uploaded as RGBA32 - 4 bytes per pixel against the roughly 0.5 B/px the
+// author shipped - and a transition keeps the outgoing scene resident while the
+// incoming one decodes. Nothing below re-authors artwork; three engine-side
+// levers inside the budget instead:
+//
+//   1. QualitySettings.masterTextureLimit = 1: half edge, quarter bytes, for
+//      every texture uploaded after this point (stage art, not the menu that is
+//      already resident).
+//   2. QualitySettings.antiAliasing = 0: drops the 4x MSAA render target.
+//   3. Resources.UnloadUnusedAssets() + GC.Collect() on every memory warning,
+//      and whenever phys_footprint crosses the ceiling, throttled so a doomed
+//      load can shed the previous scene instead of taking the app down with it.
+//
+// phys_footprint and its peak are logged, so the next device log reports the
+// real ceiling rather than another guess. These are the same MB the kernel's
+// memorystatus layer acts on.
+// =============================================================================
+
+#define kMemCeilingMb 1300
+#define kMemTickSec   2.0
+
+static int    g_memStarted   = 0;
+static int    g_memApplied   = 0;
+static int    g_memPurges    = 0;
+static double g_memLastPurge = -1000.0;
+static int    g_memLastLogMb = -1;
+static int    g_memPeakMb    = 0;
+static unsigned long g_memTicks = 0;
+
+static Il2CppClass *g_cQuality = NULL;
+static Il2CppClass *g_cApp     = NULL;
+static Il2CppClass *g_cRes     = NULL;
+static Il2CppClass *g_cGc      = NULL;
+
+static double gb_mono(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0.0;
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1.0e9;
+}
+
+// phys_footprint is the number jetsam compares against the per-process limit;
+// resident_size also counts clean file-backed pages and reads far too high on a
+// 2.1 GB asset tree. The MACH_TASK_BASIC_INFO branch is only for a kernel that
+// refuses TASK_VM_INFO.
+static int gb_footprint(int *peakMb)
+{
+    if (peakMb) *peakMb = 0;
+    task_vm_info_data_t ti;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&ti, &count) == KERN_SUCCESS) {
+        if (peakMb) *peakMb = (int)(ti.resident_size_peak / (1024ull * 1024ull));
+        return (int)(ti.phys_footprint / (1024ull * 1024ull));
+    }
+    struct mach_task_basic_info bi;
+    mach_msg_type_number_t c2 = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&bi, &c2) != KERN_SUCCESS)
+        return -1;
+    if (peakMb) *peakMb = (int)(bi.resident_size_max / (1024ull * 1024ull));
+    return (int)(bi.resident_size / (1024ull * 1024ull));
+}
+
+// il2cpp_runtime_invoke takes a pointer to each argument; the parameter type
+// comes from the MethodInfo, so one int serves every setter and GC.Collect(int).
+// Return values are deliberately ignored: UnloadUnusedAssets hands back an
+// AsyncOperation that completes on its own.
+static int gb_static_call(Il2CppClass *k, const char *name, const char *alt,
+                          int arg, int wantInt, const char *label)
+{
+    if (!k) return 0;
+    MethodInfo *m = NULL;
+    const char *names[2] = { name, alt };
+    for (int i = 0; i < 2 && !m; i++) {
+        if (!names[i]) continue;
+        m = f_class_get_method_from_name(k, names[i], wantInt ? 1 : 0);
+        if (!m) m = f_class_get_method_from_name(k, names[i], wantInt ? 0 : 1);
+    }
+    if (!m) {
+        const char *cn = f_class_get_name(k);
+        fprintf(stderr, TAG "mem: %s missing on %s\n", name, cn ? cn : "?");
+        return 0;
+    }
+    int isInt = wantInt || f_method_get_param_count(m) >= 1;
+    void *args[1] = { &arg };
+    Il2CppException *exc = NULL;
+    f_runtime_invoke(m, NULL, isInt ? args : NULL, &exc);
+    if (exc) {
+        char msg[192];
+        exc_message(exc, msg, sizeof msg);
+        fprintf(stderr, TAG "mem: %s threw: %s\n", label, msg);
+        return 0;
+    }
+    return 1;
+}
+
+static void gb_apply_budget(void)
+{
+    if (g_memApplied) return;
+
+    Il2CppDomain *d = f_domain_get();
+    if (!d) { fprintf(stderr, TAG "mem: no domain yet\n"); return; }
+    if (!g_cQuality) g_cQuality = find_class_any(d, "UnityEngine", "QualitySettings");
+    if (!g_cApp)     g_cApp     = find_class_any(d, "UnityEngine", "Application");
+    if (!g_cRes)     g_cRes     = find_class_any(d, "UnityEngine", "Resources");
+    if (!g_cGc)      g_cGc      = find_class_any(d, "System", "GC");
+    if (!g_cQuality) {
+        fprintf(stderr, TAG "mem: QualitySettings not reachable yet\n");
+        return;
+    }
+
+    // masterTextureLimit is the pre-2022.2 spelling; 2022.3 still carries it but
+    // also exposes globalTextureMipmapLimit, so both are tried in order.
+    int half = gb_static_call(g_cQuality, "set_masterTextureLimit",
+                              "set_globalTextureMipmapLimit", 1, 1, "masterTextureLimit");
+    int aa   = gb_static_call(g_cQuality, "set_antiAliasing", NULL, 0, 1, "antiAliasing");
+    int bg   = gb_static_call(g_cApp, "set_backgroundLoadingPriority", NULL, 0, 1,
+                              "backgroundLoadingPriority");
+
+    g_memApplied = 1;
+    fprintf(stderr, TAG "mem: budget applied masterTexLimit=%s antiAliasing=%s "
+                        "bgLoadingPriority=%s ceiling=%d MB\n",
+            half ? "half" : "failed", aa ? "off" : "failed",
+            bg ? "low" : "failed", kMemCeilingMb);
+}
+
+static void gb_purge(const char *why)
+{
+    // Nothing to call yet: the notification can arrive before the budget has
+    // resolved its classes.
+    if (!g_cRes && !g_cGc) return;
+    double now = gb_mono();
+    if (now - g_memLastPurge < 4.0) return;
+    g_memLastPurge = now;
+    g_memPurges++;
+
+    int before = gb_footprint(NULL);
+    gb_static_call(g_cRes, "UnloadUnusedAssets", NULL, 0, 0, "UnloadUnusedAssets");
+    gb_static_call(g_cGc, "Collect", NULL, 0, 0, "GC.Collect");
+    // A quality-level change re-applies the whole quality block, which can reset
+    // the texture limit; re-arm it so the next texture still uploads at half.
+    g_memApplied = 0;
+    gb_apply_budget();
+    int after = gb_footprint(NULL);
+    fprintf(stderr, TAG "mem: purge #%d (%s) %d -> %d MB\n",
+            g_memPurges, why, before, after);
+}
+
+static void gb_mem_tick(void)
+{
+    if (!g_memApplied) {
+        gb_apply_budget();
+        if (!g_memApplied) return;
+    }
+
+    int peak = 0;
+    int mb = gb_footprint(&peak);
+    if (mb < 0) return;
+    if (peak > g_memPeakMb) g_memPeakMb = peak;
+    g_memTicks++;
+
+    int delta = (g_memLastLogMb < 0) ? 9999 : mb - g_memLastLogMb;
+    if (delta >= 48 || delta <= -48 || (g_memTicks % 15) == 0) {
+        g_memLastLogMb = mb;
+        fprintf(stderr, TAG "mem: footprint=%d MB peak=%d MB purges=%d\n",
+                mb, g_memPeakMb, g_memPurges);
+    }
+
+    if (mb >= kMemCeilingMb) gb_purge("ceiling");
+
+    // The game applies its own quality block on scene start, which silently
+    // restores full-size textures. Re-arm once a minute so the limit is never
+    // gone for a whole session.
+    if (g_memTicks % 30 == 0) {
+        g_memApplied = 0;
+        gb_apply_budget();
+    }
+}
+
+// Kept in a static so the source is not released while suspended: a resumed
+// dispatch source is retained by GCD, but only as long as a strong reference
+// exists on our side.
+static dispatch_source_t g_memTimer = nil;
+
+static void gb_mem_start(void)
+{
+    if (g_memStarted) return;
+    g_memStarted = 1;
+
+    gb_apply_budget();
+
+    // The overlay's CADisplayLink only exists once a UnityView is up, so the
+    // memory watchdog owns its own timer and does not depend on it.
+    g_memTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                        dispatch_get_main_queue());
+    if (!g_memTimer) {
+        fprintf(stderr, TAG "mem: timer create failed\n");
+        return;
+    }
+    dispatch_source_set_timer(g_memTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, 1500ull * NSEC_PER_MSEC),
+                              (uint64_t)(kMemTickSec * (double)NSEC_PER_SEC),
+                              (uint64_t)(200ull * NSEC_PER_MSEC));
+    dispatch_source_set_event_handler(g_memTimer, ^{ gb_mem_tick(); });
+    dispatch_resume(g_memTimer);
+    fprintf(stderr, TAG "mem: watchdog started (%.0f s tick)\n", kMemTickSec);
+}
+
 // --- bootstrap -------------------------------------------------------------
 
 static void *worker(void *unused)
@@ -2812,6 +3043,11 @@ static void *worker(void *unused)
     }
     fprintf(stderr, TAG "IL2CPP API bound\n");
 
+    // The runtime is provably usable from here (bind_api succeeded on this
+    // thread), so the budget can be set before the stage art loads. The
+    // managed side must be touched on the main thread.
+    dispatch_async(dispatch_get_main_queue(), ^{ gb_mem_start(); });
+
     int resolved = 0;
     for (int i = 0; i < 40 && !resolved; i++) {
         int r = stage1();
@@ -2844,6 +3080,20 @@ static void gbpad_init(void)
                     object:nil
                      queue:nil
                 usingBlock:^(NSNotification *n) { on_did_become_active(n); }];
+
+    // The foreground path that already works in this app: eight of these in
+    // seven minutes preceded the silent kill. UnloadUnusedAssets + Collect is
+    // the only thing an app can do when UIKit asks it to shrink.
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:UIApplicationDidReceiveMemoryWarningNotification
+                    object:nil
+                     queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *n) {
+                    (void)n;
+                    fprintf(stderr, TAG "mem: applicationDidReceiveMemoryWarning\n");
+                    gb_mem_start();
+                    gb_purge("warning");
+                }];
     pthread_t t;
     if (pthread_create(&t, NULL, worker, NULL) == 0)
         pthread_detach(t);
