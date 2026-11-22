@@ -1044,10 +1044,10 @@ static float gbpad_mag(void)
             // so the stick is at base + deviceRoot + rel.
             unsigned char *live = (unsigned char *)sp + g_devByteOff;
             float a = 0, b = 0;
-            memcpy(&a, live + g_gbStickByte, 4);
-            memcpy(&b, live + g_gbStickByte + 4, 4);
-            fprintf(stderr, TAG "  raw stick base=%p +%u+%d -> (%.3f, %.3f)\n",
-                    sp, g_devByteOff, g_gbStickByte, a, b);
+            memcpy(&a, live + 4, 4);      // GamepadState.leftStick
+            memcpy(&b, live + 8, 4);
+            fprintf(stderr, TAG "  raw stick base=%p +%u+4 -> (%.3f, %.3f)\n",
+                    sp, g_devByteOff, a, b);
         } else {
             fprintf(stderr, TAG "  raw stick ptr = %p (exc=%p)\n", sp, (void *)e4);
         }
@@ -1089,8 +1089,8 @@ static void gbpad_direct_apply(void)
         // Same correction as gbpad_frame: the control's currentStatePtr is the
         // shared buffer base, the device state starts at +deviceRoot.
         unsigned char *live = (unsigned char *)sp + g_devByteOff;
-        memcpy(live + g_gbStickByte, &sx, 4);
-        memcpy(live + g_gbStickByte + 4, &sy, 4);
+        memcpy(live + 4, &sx, 4);          // GamepadState.leftStick
+        memcpy(live + 8, &sy, 4);
     }
 
     // ButtonControl stores a float, so pressed is 1.0 rather than a bit.
@@ -1098,9 +1098,9 @@ static void gbpad_direct_apply(void)
     float south = (b & 1u)    ? 1.0f : 0.0f;   // GamepadButton.ButtonSouth
     float start = (b & 4096u) ? 1.0f : 0.0f;   // GamepadButton.Start
     void *bs = ctrl_state(g_device, g_getButtonSouth);
-    if (bs) memcpy((unsigned char *)bs + g_devByteOff + g_gbByte[GB_SOUTH], &south, 4);
+    if (bs) memcpy((unsigned char *)bs + g_devByteOff, &south, 4);
     void *st = ctrl_state(g_device, g_getStartButton);
-    if (st) memcpy((unsigned char *)st + g_devByteOff + g_gbByte[GB_START], &start, 4);
+    if (st) memcpy((unsigned char *)st + g_devByteOff, &start, 4);
 }
 
 // --- keyboard injection ----------------------------------------------------
