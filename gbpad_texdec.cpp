@@ -31,10 +31,29 @@
 #include <string.h>
 #include <stdio.h>
 #include <dlfcn.h>
+#include <mach/mach_time.h>
 
 #include "bc7_tables.h"
 
 #define TAG "[gbpad-tex] "
+
+// Decode counters, read by gbpad.mm's main-thread stall probe. A frame gap
+// whose window contains new decodes is the shim; a gap with none is GC, asset
+// streaming or the OS. The worst single decode is tracked because one 200 ms
+// BC7 pass is exactly the kind of cost that shows up as a hitch.
+extern "C" unsigned long gbpad_tex_decodes = 0;
+extern "C" double        gbpad_tex_ms_worst = 0.0;
+
+static double gb_texdec_now_ms(void)
+{
+    static mach_timebase_info_data_t tb = {0, 0};
+    if (tb.denom == 0)
+        (void)mach_timebase_info(&tb);
+    uint64_t t = mach_absolute_time();
+    if (tb.denom == 0)
+        return 0.0;
+    return (double)t * (double)tb.numer / (double)tb.denom / 1e6;
+}
 
 // Offset inside UnityFramework of the instruction after the one we clobber.
 // Resolved at load time so it survives ASLR.
@@ -580,12 +599,17 @@ void *gbpad_decode(int srcFmt, int dstFmt, int w, int h,
                    const void *src, int srcW, int srcH, void *dst)
 {
     (void)srcH;
+    // Timed here rather than inside the per-format paths: the number that
+    // matters is the wall time the engine's loading thread spent inside this
+    // function, whichever branch it took.
+    double t0 = gb_texdec_now_ms();
     // The engine asks for the sRGB variant, not the linear one: a 512x720 BC7
     // arrives as dstFmt 4 (RGBA32_SRGB), never 8 (RGBA32_UNorm). Both are four
     // bytes per pixel, so the same write serves either. Getting this wrong cost
     // a build: every request was refused at the door and 284 textures failed
     // with the decoder never having been entered once.
     const int dstIsRGBA32 = (dstFmt == 4 || dstFmt == 8);
+    void *ret = NULL;
 
     // Anything we cannot reproduce exactly returns NULL, and the naked stub
     // above hands control back to the original body so current behaviour is
@@ -596,17 +620,20 @@ void *gbpad_decode(int srcFmt, int dstFmt, int w, int h,
         case 97:   // DXT1 linear
             dxt_image(8, w, h, srcW, src, dst);
             report(srcFmt, w, h, srcW, dst);
-            return (void *)1;
+            ret = (void *)1;
+            goto done;
         case 100:  // DXT5 sRGB
         case 101:  // DXT5 linear
             dxt_image(16, w, h, srcW, src, dst);
             report(srcFmt, w, h, srcW, dst);
-            return (void *)1;
+            ret = (void *)1;
+            goto done;
         case 108:  // BC7 sRGB
         case 109:  // BC7 linear
             if (bc7_image(w, h, srcW, src, dst)) {
                 report(srcFmt, w, h, srcW, dst);
-                return (void *)1;
+                ret = (void *)1;
+                goto done;
             }
             break;
         default:
@@ -624,7 +651,23 @@ void *gbpad_decode(int srcFmt, int dstFmt, int w, int h,
                     srcFmt, dstFmt, w, h);
         }
     }
-    return NULL;
+
+done:
+    {
+        double ms = gb_texdec_now_ms() - t0;
+        if (ms >= 0.0) {
+            gbpad_tex_decodes++;
+            if (ms > gbpad_tex_ms_worst)
+                gbpad_tex_ms_worst = ms;
+            // 40 ms is past a frame at 60 Hz: a single decode that long is a
+            // visible hitch on the loading path, and it says so on its own line.
+            if (ms >= 40.0) {
+                fprintf(stderr, TAG "slow decode fmt=%d %dx%d %.1f ms ok=%d\n",
+                        srcFmt, w, h, ms, ret != NULL);
+            }
+        }
+    }
+    return ret;
 }
 
 // ---------------------------------------------------------------------- setup
