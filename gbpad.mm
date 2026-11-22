@@ -88,6 +88,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <mach/task_info.h>
 #include <time.h>
 
@@ -1695,6 +1696,35 @@ static void gb_gc_poll(void);
 
 static unsigned long g_gbFrames = 0;    // display-link frames driven so far
 
+// --- main-thread stall probe ------------------------------------------------
+// The display link fires on the main thread. A gap between two ticks is time
+// the main thread spent somewhere else, and anything past 250 ms is the hitch
+// the player calls "卡". Logging the gap together with the counters that moved
+// while it lasted names the culprit on device instead of leaving it to be
+// guessed at from a profiler we do not have.
+static double gb_now_ms(void)
+{
+    static mach_timebase_info_data_t tb = {0, 0};
+    if (tb.denom == 0)
+        (void)mach_timebase_info(&tb);
+    uint64_t t = mach_absolute_time();
+    if (tb.denom == 0)
+        return 0.0;
+    return (double)t * (double)tb.numer / (double)tb.denom / 1e6;
+}
+
+// Written by gbpad_texdec.cpp: how many textures the BC7/DXT shim decoded and
+// how long the slowest single decode took. A stall whose window contains a new
+// decode is the decoder; a stall with no decode is GC, asset streaming or the
+// OS.
+extern "C" unsigned long gbpad_tex_decodes;
+extern "C" double        gbpad_tex_ms_worst;
+
+static double         g_gbLastTickMs   = 0.0;
+static double         g_gbWorstStallMs = 0.0;
+static unsigned long  g_gbStalls       = 0;
+static unsigned long  g_gbStallTexSeen = 0;
+
 // One frame of input: live buffer first, then the queued event so the next
 // InputSystem.Update re-asserts the same values instead of zeroing them.
 static void gbpad_frame(void)
@@ -1702,6 +1732,26 @@ static void gbpad_frame(void)
     if (!g_device || !g_curStatePtr || !g_gbStateBase || !g_gbLive) return;
 
     g_gbFrames++;
+    {
+        double nowMs = gb_now_ms();
+        if (g_gbLastTickMs > 0.0 && nowMs > g_gbLastTickMs) {
+            double gap = nowMs - g_gbLastTickMs;
+            if (gap >= 250.0) {
+                unsigned long tex = gbpad_tex_decodes;
+                g_gbStalls++;
+                if (gap > g_gbWorstStallMs)
+                    g_gbWorstStallMs = gap;
+                fprintf(stderr, TAG "stall gap=%.2fs frame=%lu texDecodes=%lu "
+                                    "texNew=%lu texWorstMs=%.1f held=0x%x\n",
+                        gap / 1000.0, g_gbFrames - 1, tex,
+                        tex >= g_gbStallTexSeen ? tex - g_gbStallTexSeen : 0ul,
+                        gbpad_tex_ms_worst, g_gbHeldTouch | g_gbHeldPad);
+                g_gbStallTexSeen = tex;
+            }
+        }
+        g_gbLastTickMs = nowMs;
+    }
+
     // Every frame: a 15 Hz poll could miss a press entirely, and the message
     // sends involved are cheap next to a lost input.
     gb_gc_poll();
@@ -1798,15 +1848,19 @@ static void gbpad_frame(void)
     }
 
     // Heartbeat: one line every 10 s with the exact masks the writer used, so
-    // an intermittent pad can be told apart from an intermittent reader.
+    // an intermittent pad can be told apart from an intermittent reader. The
+    // stall counters ride along: a session that hitches reports how often and
+    // how badly without needing a separate grep.
     if ((g_gbFrames % 600ul) == 0ul) {
         float hx = -9.0f, hy = -9.0f;
         memcpy(&hx, live + g_gbStickByte, 4);
         memcpy(&hy, live + g_gbStickByte + 4, 4);
         fprintf(stderr, TAG "hb frame=%lu pad=0x%x latch=0x%x touch=0x%x "
-                            "stick=(%.2f,%.2f) read=(%.2f,%.2f) manualUpdate=%d\n",
+                            "stick=(%.2f,%.2f) read=(%.2f,%.2f) manualUpdate=%d "
+                            "stalls=%lu worstStall=%.2fs texDecodes=%lu texWorstMs=%.1f\n",
                 g_gbFrames, g_gbHeldPad, padHeld, g_gbHeldTouch, x, y, hx, hy,
-                g_manualUpdate);
+                g_manualUpdate, g_gbStalls, g_gbWorstStallMs / 1000.0,
+                gbpad_tex_decodes, gbpad_tex_ms_worst);
     }
 
     if (g_manualUpdate && g_sysUpdate) {
