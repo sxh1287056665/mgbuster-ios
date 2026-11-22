@@ -1038,10 +1038,16 @@ static float gbpad_mag(void)
         Il2CppException *e4 = NULL;
         void *sp = (void *)f_runtime_invoke(g_curStatePtr, stick, NULL, &e4);
         if (sp && !e4 && (uintptr_t)sp > 0x100000000ULL) {
+            // GetFrontBufferForDevice returns the SHARED front buffer base and
+            // the control's byteOffset is absolute inside it
+            // (InputStateBuffers.cs:345 adds the device offset the same way),
+            // so the stick is at base + deviceRoot + rel.
+            unsigned char *live = (unsigned char *)sp + g_devByteOff;
             float a = 0, b = 0;
-            memcpy(&a, sp, 4);
-            memcpy(&b, (unsigned char *)sp + 4, 4);
-            fprintf(stderr, TAG "  raw stick @%p = (%.3f, %.3f)\n", sp, a, b);
+            memcpy(&a, live + g_gbStickByte, 4);
+            memcpy(&b, live + g_gbStickByte + 4, 4);
+            fprintf(stderr, TAG "  raw stick base=%p +%u+%d -> (%.3f, %.3f)\n",
+                    sp, g_devByteOff, g_gbStickByte, a, b);
         } else {
             fprintf(stderr, TAG "  raw stick ptr = %p (exc=%p)\n", sp, (void *)e4);
         }
@@ -1080,8 +1086,11 @@ static void gbpad_direct_apply(void)
     float sy = g_stickPtr ? g_stickPtr[1] : 0.0f;
     void *sp = ctrl_state(g_device, g_getLeftStick);
     if (sp) {
-        memcpy(sp, &sx, 4);
-        memcpy((unsigned char *)sp + 4, &sy, 4);
+        // Same correction as gbpad_frame: the control's currentStatePtr is the
+        // shared buffer base, the device state starts at +deviceRoot.
+        unsigned char *live = (unsigned char *)sp + g_devByteOff;
+        memcpy(live + g_gbStickByte, &sx, 4);
+        memcpy(live + g_gbStickByte + 4, &sy, 4);
     }
 
     // ButtonControl stores a float, so pressed is 1.0 rather than a bit.
@@ -1089,9 +1098,9 @@ static void gbpad_direct_apply(void)
     float south = (b & 1u)    ? 1.0f : 0.0f;   // GamepadButton.ButtonSouth
     float start = (b & 4096u) ? 1.0f : 0.0f;   // GamepadButton.Start
     void *bs = ctrl_state(g_device, g_getButtonSouth);
-    if (bs) memcpy(bs, &south, 4);
+    if (bs) memcpy((unsigned char *)bs + g_devByteOff + g_gbByte[GB_SOUTH], &south, 4);
     void *st = ctrl_state(g_device, g_getStartButton);
-    if (st) memcpy(st, &start, 4);
+    if (st) memcpy((unsigned char *)st + g_devByteOff + g_gbByte[GB_START], &start, 4);
 }
 
 // --- keyboard injection ----------------------------------------------------
@@ -1658,17 +1667,29 @@ static void gbpad_resolve_buttons(void)
     for (int i = 0; i < GB_NBTN; i++) gbpad_resolve_button(i);
 }
 
+// Defined with the physical-controller block far below; called from the
+// display link so a pad whose valueChangedHandler never fires still gets read.
+static void gb_gc_poll(void);
+
+static unsigned long g_gbFrames = 0;    // display-link frames driven so far
+
 // One frame of input: live buffer first, then the queued event so the next
 // InputSystem.Update re-asserts the same values instead of zeroing them.
 static void gbpad_frame(void)
 {
     if (!g_device || !g_curStatePtr || !g_gbStateBase || !g_gbLive) return;
 
+    g_gbFrames++;
+    if ((g_gbFrames & 3ul) == 0) gb_gc_poll();
+
     unsigned held = g_gbHeldTouch | g_gbHeldPad;
     float x = g_gbPadStick ? g_gbStickPad[0] : g_gbStickTouch[0];
     float y = g_gbPadStick ? g_gbStickPad[1] : g_gbStickTouch[1];
 
-    unsigned char *live = (unsigned char *)g_gbStateBase;
+    // g_gbStateBase is InputStateBuffers' shared front buffer; the device's own
+    // state begins at +g_devByteOff. Without this the stick and every button
+    // write landed in the slot of whichever device owns the buffer head.
+    unsigned char *live = (unsigned char *)g_gbStateBase + g_devByteOff;
     unsigned char *evp = (g_evBuffer && g_payloadOff >= 0)
                        ? (unsigned char *)g_evBuffer + g_payloadOff : NULL;
 
@@ -1699,6 +1720,31 @@ static void gbpad_frame(void)
     if (evp) {
         memcpy(evp + g_gbStickByte, &x, 4);
         memcpy(evp + g_gbStickByte + 4, &y, 4);
+    }
+
+    // Proof-of-write: read the bytes back from the address the engine reads.
+    {
+        static unsigned sHeld = 0xFFFFFFFFu;
+        static int sX100 = 0x7FFFFFFF, sY100 = 0x7FFFFFFF;
+        int x100 = (int)(x * 100.0f), y100 = (int)(y * 100.0f);
+        if (g_gbFrames == 1 || g_gbFrames % 600ul == 0ul
+            || held != sHeld || x100 != sX100 || y100 != sY100) {
+            float rx = -9.0f, ry = -9.0f;
+            memcpy(&rx, live + g_gbStickByte, 4);
+            memcpy(&ry, live + g_gbStickByte + 4, 4);
+            fprintf(stderr,
+                    TAG "frame #%lu held=0x%x (touch=0x%x pad=0x%x) stick=(%.2f,%.2f) "
+                        "live=%p read=(%.2f,%.2f)\n",
+                    g_gbFrames, held, g_gbHeldTouch, g_gbHeldPad, x, y,
+                    (void *)(live + g_gbStickByte), rx, ry);
+            sHeld = held; sX100 = x100; sY100 = y100;
+        }
+    }
+
+    if (g_gbFrames == 120 || g_gbFrames == 600) {
+        float mag = gbpad_mag();
+        fprintf(stderr, TAG "selftest frame=%lu leftStick magnitude=%.3f held=0x%x\n",
+                g_gbFrames, mag, held);
     }
 
     if (g_evBuffer && g_queueMethod) {
@@ -2427,6 +2473,11 @@ static int   g_gcDiscovery = 0;
 static int   g_gcAttached  = 0;
 static Class g_gcClass     = Nil;
 static char  g_gcMark;              // associated-object key: controller handled
+static int   g_gcEvents    = 0;     // handler callbacks + polls that produced data
+static int   g_gcPolls     = 0;
+static unsigned g_gcLastHeld = 0xFFFFFFFFu;
+static float g_gcLastX     = 9.0f;
+static float g_gcLastY     = 9.0f;
 
 static void gb_gc_rescan(void);
 static void gb_gc_discover(void);
@@ -2485,17 +2536,111 @@ static float gb_axis(id owner, const char *stickName, const char *axisName)
     return ((float (*)(id, SEL))objc_msgSend)(a, v);
 }
 
+// extendedGamepad -> gamepad -> microGamepad. Several MFi pads only expose the
+// basic profile, and the Siri remote only the micro one.
+static id gb_gc_profile(id c)
+{
+    id g = gb_elem(c, "extendedGamepad");
+    if (g) return g;
+    g = gb_elem(c, "gamepad");
+    if (g) return g;
+    return gb_elem(c, "microGamepad");
+}
+
+// One place that turns a GCController profile into the overlay's bit mask and
+// stick vector, so the handler and the poller can never drift apart.
+static void gb_gc_read(id pad, unsigned *mask, float *px, float *py)
+{
+    unsigned m = 0;
+    if (gb_pressed(pad, "buttonA"))     m |= 1u << GB_SOUTH;
+    if (gb_pressed(pad, "buttonB"))     m |= 1u << GB_EAST;
+    if (gb_pressed(pad, "buttonX"))     m |= 1u << GB_WEST;
+    if (gb_pressed(pad, "buttonY"))     m |= 1u << GB_NORTH;
+    if (gb_pressed(pad, "leftShoulder"))  m |= 1u << GB_LB;
+    if (gb_pressed(pad, "rightShoulder")) m |= 1u << GB_RB;
+    if (gb_pressed(pad, "buttonMenu"))    m |= 1u << GB_START;
+    if (gb_pressed(pad, "buttonOptions")) m |= 1u << GB_SELECT;
+    if (gb_pressed(pad, "dpadUp"))        m |= 1u << GB_DUP;
+    if (gb_pressed(pad, "dpadDown"))      m |= 1u << GB_DDOWN;
+    if (gb_pressed(pad, "dpadLeft"))      m |= 1u << GB_DLEFT;
+    if (gb_pressed(pad, "dpadRight"))     m |= 1u << GB_DRIGHT;
+    if (gb_pressed(pad, "leftTrigger"))   m |= 1u << GB_LT;
+    if (gb_pressed(pad, "rightTrigger"))  m |= 1u << GB_RT;
+    if (gb_pressed(pad, "leftThumbstickButton"))  m |= 1u << GB_LSTICK;
+    if (gb_pressed(pad, "rightThumbstickButton")) m |= 1u << GB_RSTICK;
+
+    float x = gb_axis(pad, "leftThumbstick", "xAxis");
+    float y = gb_axis(pad, "leftThumbstick", "yAxis");
+    float dx = gb_axis(pad, "dpad", "xAxis");
+    float dy = gb_axis(pad, "dpad", "yAxis");
+    if (fabsf(dx) > 0.5f) x = dx;
+    if (fabsf(dy) > 0.5f) y = dy;
+    if (fabsf(x) < 0.14f) x = 0.0f;
+    if (fabsf(y) < 0.14f) y = 0.0f;
+
+    if (mask) *mask = m;
+    if (px) *px = x;
+    if (py) *py = y;
+}
+
+// Publish the pad state the display link reads, and log only on change.
+static void gb_gc_commit(unsigned m, float x, float y, const char *src)
+{
+    g_gcEvents++;
+    int changed = (m != g_gcLastHeld)
+               || (x > g_gcLastX + 0.02f) || (g_gcLastX > x + 0.02f)
+               || (y > g_gcLastY + 0.02f) || (g_gcLastY > y + 0.02f);
+    g_gcLastHeld = m;
+    g_gcLastX = x;
+    g_gcLastY = y;
+    g_gbHeldPad = m;
+    g_gbStickPad[0] = x;
+    g_gbStickPad[1] = y;
+    g_gbPadStick = (x != 0.0f || y != 0.0f) ? 1 : 0;
+    if (changed)
+        fprintf(stderr, TAG "gc: %s #%d held=0x%x stick=(%.2f,%.2f)\n",
+                src, g_gcEvents, m, x, y);
+}
+
+// Frame-polled fallback. valueChangedHandler is the documented path, but this
+// binary has no InputSystem iOS backend and a pad can be connected while the
+// handler stays silent; polling the controller directly costs one message send
+// per four frames and removes that failure mode entirely.
+static void gb_gc_poll(void)
+{
+    if (!gb_gc_ensure()) return;
+    SEL selControllers = sel_registerName("controllers");
+    if (![(id)g_gcClass respondsToSelector:selControllers]) return;
+    id arr = ((id (*)(id, SEL))objc_msgSend)((id)g_gcClass, selControllers);
+    if (!arr || [(NSArray *)arr count] == 0) return;
+
+    id c = [(NSArray *)arr firstObject];
+    if (!c) return;
+    id g = gb_gc_profile(c);
+    if (!g) return;
+
+    g_gcPolls++;
+    unsigned m = 0;
+    float x = 0.0f, y = 0.0f;
+    @try {
+        gb_gc_read(g, &m, &x, &y);
+    } @catch (NSException *ex) {
+        fprintf(stderr, TAG "gc: poll threw: %s\n", [[ex reason] UTF8String]);
+        return;
+    }
+    gb_gc_commit(m, x, y, "poll");
+}
+
 static void gb_gc_attach(id c)
 {
     if (!c) return;
     if (objc_getAssociatedObject(c, &g_gcMark)) return;   // already handled
 
-    // extendedGamepad -> gamepad -> microGamepad. Several MFi pads only expose
-    // the basic profile, and the Siri remote only the micro one.
-    id g = gb_elem(c, "extendedGamepad");
+    id g = gb_gc_profile(c);
     const char *profile = "extended";
-    if (!g) { g = gb_elem(c, "gamepad");      profile = "basic"; }
-    if (!g) { g = gb_elem(c, "microGamepad"); profile = "micro"; }
+    if (g && !gb_elem(c, "extendedGamepad")) {
+        profile = gb_elem(c, "gamepad") ? "basic" : "micro";
+    }
     if (!g) {
         fprintf(stderr, TAG "gc: controller has no gamepad profile\n");
         return;
@@ -2515,35 +2660,9 @@ static void gb_gc_attach(id c)
         (void)element;
         @try {
             unsigned m = 0;
-            if (gb_pressed(pad, "buttonA"))     m |= 1u << GB_SOUTH;
-            if (gb_pressed(pad, "buttonB"))     m |= 1u << GB_EAST;
-            if (gb_pressed(pad, "buttonX"))     m |= 1u << GB_WEST;
-            if (gb_pressed(pad, "buttonY"))     m |= 1u << GB_NORTH;
-            if (gb_pressed(pad, "leftShoulder"))  m |= 1u << GB_LB;
-            if (gb_pressed(pad, "rightShoulder")) m |= 1u << GB_RB;
-            if (gb_pressed(pad, "buttonMenu"))    m |= 1u << GB_START;
-            if (gb_pressed(pad, "buttonOptions")) m |= 1u << GB_SELECT;
-            if (gb_pressed(pad, "dpadUp"))        m |= 1u << GB_DUP;
-            if (gb_pressed(pad, "dpadDown"))      m |= 1u << GB_DDOWN;
-            if (gb_pressed(pad, "dpadLeft"))      m |= 1u << GB_DLEFT;
-            if (gb_pressed(pad, "dpadRight"))     m |= 1u << GB_DRIGHT;
-            if (gb_pressed(pad, "leftTrigger"))   m |= 1u << GB_LT;
-            if (gb_pressed(pad, "rightTrigger"))  m |= 1u << GB_RT;
-            if (gb_pressed(pad, "leftThumbstickButton"))  m |= 1u << GB_LSTICK;
-            if (gb_pressed(pad, "rightThumbstickButton")) m |= 1u << GB_RSTICK;
-            g_gbHeldPad = m;
-
-            float x = gb_axis(pad, "leftThumbstick", "xAxis");
-            float y = gb_axis(pad, "leftThumbstick", "yAxis");
-            float dx = gb_axis(pad, "dpad", "xAxis");
-            float dy = gb_axis(pad, "dpad", "yAxis");
-            if (fabsf(dx) > 0.5f) x = dx;
-            if (fabsf(dy) > 0.5f) y = dy;
-            if (fabsf(x) < 0.14f) x = 0.0f;
-            if (fabsf(y) < 0.14f) y = 0.0f;
-            g_gbStickPad[0] = x;
-            g_gbStickPad[1] = y;
-            g_gbPadStick = (x != 0.0f || y != 0.0f) ? 1 : 0;
+            float x = 0.0f, y = 0.0f;
+            gb_gc_read(pad, &m, &x, &y);
+            gb_gc_commit(m, x, y, "handler");
         } @catch (NSException *ex) {
             fprintf(stderr, TAG "gc: handler threw: %s\n",
                     [[ex reason] UTF8String]);
