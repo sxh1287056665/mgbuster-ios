@@ -2969,6 +2969,9 @@ static void gb_apply_budget(void)
             bg ? "low" : "failed", kMemCeilingMb);
 }
 
+// Kept for a future run that can prove a reclaim; nothing calls it today,
+// because on this game's object graph it freed exactly zero MB per call.
+__attribute__((unused))
 static void gb_purge(const char *why)
 {
     // Nothing to call yet: the notification can arrive before the budget has
@@ -3128,18 +3131,20 @@ static void gbpad_init(void)
                      queue:nil
                 usingBlock:^(NSNotification *n) { on_did_become_active(n); }];
 
-    // The foreground path that already works in this app: eight of these in
-    // seven minutes preceded the silent kill. UnloadUnusedAssets + Collect is
-    // the only thing an app can do when UIKit asks it to shrink.
+    // Memory warnings are logged, not acted on. Measured on device in v58: 58
+    // purge runs, each reclaiming 0 MB ("1498 -> 1498", "1452 -> 1452") because
+    // the game holds its own object graph, while each run froze the main thread
+    // for 4-6 s - the same frozen windows in which the pad stopped answering.
+    // A no-op that costs six seconds is worse than doing nothing at all.
     [[NSNotificationCenter defaultCenter]
         addObserverForName:UIApplicationDidReceiveMemoryWarningNotification
                     object:nil
                      queue:[NSOperationQueue mainQueue]
                 usingBlock:^(NSNotification *n) {
                     (void)n;
-                    fprintf(stderr, TAG "mem: applicationDidReceiveMemoryWarning\n");
-                    gb_mem_start();
-                    gb_purge("warning");
+                    int mb = gb_footprint(NULL);
+                    fprintf(stderr, TAG "mem: applicationDidReceiveMemoryWarning at %d MB "
+                                        "(purge suppressed by design)\n", mb);
                 }];
     pthread_t t;
     if (pthread_create(&t, NULL, worker, NULL) == 0)
