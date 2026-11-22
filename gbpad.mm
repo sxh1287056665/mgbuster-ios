@@ -1564,6 +1564,14 @@ static unsigned g_gbHeldPad = 0;
 static float g_gbStickTouch[2] = {0.0f, 0.0f};
 static float g_gbStickPad[2] = {0.0f, 0.0f};
 static volatile int g_gbPadStick = 0;
+
+// A short press can arrive through valueChangedHandler alone and be cleared
+// by the next frame poll, which re-reads the whole pad and does not remember
+// what the handler just said. Latching every pressed bit for a few frames is
+// what makes "sometimes it answers, sometimes it does not" go away: the
+// game's 60 Hz update is guaranteed a window of at least four frames.
+#define kGBLatchFrames 6
+static unsigned char g_gbPadLatch[GB_NBTN];
 static volatile int g_gbLive = 0;       // set once the overlay is on screen
 
 // Resolve one button's position from its own control metadata.
@@ -1694,9 +1702,17 @@ static void gbpad_frame(void)
     if (!g_device || !g_curStatePtr || !g_gbStateBase || !g_gbLive) return;
 
     g_gbFrames++;
-    if ((g_gbFrames & 3ul) == 0) gb_gc_poll();
+    // Every frame: a 15 Hz poll could miss a press entirely, and the message
+    // sends involved are cheap next to a lost input.
+    gb_gc_poll();
 
-    unsigned held = g_gbHeldTouch | g_gbHeldPad;
+    unsigned padHeld = g_gbHeldPad;
+    for (int i = 0; i < GB_NBTN; i++) {
+        if (!g_gbPadLatch[i]) continue;
+        padHeld |= (1u << i);
+        g_gbPadLatch[i]--;
+    }
+    unsigned held = g_gbHeldTouch | padHeld;
     float x = g_gbPadStick ? g_gbStickPad[0] : g_gbStickTouch[0];
     float y = g_gbPadStick ? g_gbStickPad[1] : g_gbStickTouch[1];
 
@@ -1768,6 +1784,29 @@ static void gbpad_frame(void)
         void *args[1] = { &ptr };
         Il2CppException *e = NULL;
         f_runtime_invoke(g_queueMethod, NULL, args, &e);
+        // Swallowing this was a blind spot: a throwing QueueEvent means the
+        // engine never sees the event, and the pad looks dead for no reason.
+        if (e) {
+            static int logged = 0;
+            if (logged < 8) {
+                logged++;
+                char msg[192];
+                exc_message(e, msg, sizeof msg);
+                fprintf(stderr, TAG "QueueEvent threw: %s\n", msg);
+            }
+        }
+    }
+
+    // Heartbeat: one line every 10 s with the exact masks the writer used, so
+    // an intermittent pad can be told apart from an intermittent reader.
+    if ((g_gbFrames % 600ul) == 0ul) {
+        float hx = -9.0f, hy = -9.0f;
+        memcpy(&hx, live + g_gbStickByte, 4);
+        memcpy(&hy, live + g_gbStickByte + 4, 4);
+        fprintf(stderr, TAG "hb frame=%lu pad=0x%x latch=0x%x touch=0x%x "
+                            "stick=(%.2f,%.2f) read=(%.2f,%.2f) manualUpdate=%d\n",
+                g_gbFrames, g_gbHeldPad, padHeld, g_gbHeldTouch, x, y, hx, hy,
+                g_manualUpdate);
     }
 
     if (g_manualUpdate && g_sysUpdate) {
@@ -2608,6 +2647,8 @@ static void gb_gc_commit(unsigned m, float x, float y, const char *src)
     g_gcLastX = x;
     g_gcLastY = y;
     g_gbHeldPad = m;
+    for (int i = 0; i < GB_NBTN; i++)
+        if (m & (1u << i)) g_gbPadLatch[i] = kGBLatchFrames;
     g_gbStickPad[0] = x;
     g_gbStickPad[1] = y;
     g_gbPadStick = (x != 0.0f || y != 0.0f) ? 1 : 0;
@@ -2829,6 +2870,7 @@ static int    g_memPurges    = 0;
 static double g_memLastPurge = -1000.0;
 static int    g_memLastLogMb = -1;
 static int    g_memPeakMb    = 0;
+static int    g_memOverCeiling = 0;
 static unsigned long g_memTicks = 0;
 
 static Il2CppClass *g_cQuality = NULL;
@@ -2933,7 +2975,7 @@ static void gb_purge(const char *why)
     // resolved its classes.
     if (!g_cRes && !g_cGc) return;
     double now = gb_mono();
-    if (now - g_memLastPurge < 4.0) return;
+    if (now - g_memLastPurge < 20.0) return;
     g_memLastPurge = now;
     g_memPurges++;
 
@@ -2965,11 +3007,16 @@ static void gb_mem_tick(void)
     int delta = (g_memLastLogMb < 0) ? 9999 : mb - g_memLastLogMb;
     if (delta >= 48 || delta <= -48 || (g_memTicks % 15) == 0) {
         g_memLastLogMb = mb;
-        fprintf(stderr, TAG "mem: footprint=%d MB peak=%d MB purges=%d\n",
-                mb, g_memPeakMb, g_memPurges);
+        fprintf(stderr, TAG "mem: footprint=%d MB peak=%d MB purges=%d over=%d\n",
+                mb, g_memPeakMb, g_memPurges, g_memOverCeiling);
     }
 
-    if (mb >= kMemCeilingMb) gb_purge("ceiling");
+    // No automatic purge on the ceiling. Measured on device: 58 purge runs,
+    // every one of them reclaimed 0 MB ("1498 -> 1498", "1452 -> 1452")
+    // because the game holds its own references, while each run forced a
+    // full-heap UnloadUnusedAssets() on the main thread. UIKit's own warning
+    // is the only signal left that is worth acting on.
+    if (mb >= kMemCeilingMb) g_memOverCeiling++;
 
     // The game applies its own quality block on scene start, which silently
     // restores full-size textures. Re-arm once a minute so the limit is never
