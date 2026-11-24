@@ -163,8 +163,10 @@ workflows:
           if [ -d "$UF" ]; then
             /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ${BUNDLE_ID}.framework" "$UF/Info.plist" || true
           fi
-          rm -rf "$P/_CodeSignature" "$P/embedded.mobileprovision" || true
-          rm -rf "$UF/_CodeSignature" || true
+          # strip every pre-existing signature and provisioning profile
+          find "$P" -type d -name '_CodeSignature' -prune -exec rm -rf {} + || true
+          find "$P" -type f -name 'embedded.mobileprovision' -delete || true
+
           printf '%s\n' \
             '<?xml version="1.0" encoding="UTF-8"?>' \
             '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
@@ -176,21 +178,45 @@ workflows:
             '<key>com.apple.developer.team-identifier</key><string>XUNERPRO</string>' \
             '</dict></plist>' > /tmp/ent.plist
           /usr/libexec/PlistBuddy -c 'Print' /tmp/ent.plist
-          echo "--- codesign adhoc ---"
-          codesign --force --deep --sign - --entitlements /tmp/ent.plist "$P" 2>&1 | tail -5 || true
+          # Xcode 16 codesign --deep no longer signs nested frameworks; sign each Mach-O,
+          # deepest path first, then outward, so outer seals stay valid.
+          echo "--- enumerate Mach-O ---"
+          : > /tmp/machos.txt
+          find "$P" -type f -print0 | xargs -0 -n1 -P4 file 2>/dev/null | grep 'Mach-O' | cut -d: -f1 > /tmp/machos.txt || true
+          echo "machos=$(grep -c . /tmp/machos.txt || true)"
+          awk '{print length, $0}' /tmp/machos.txt | sort -rn | cut -d' ' -f2- > /tmp/machos_sorted.txt || true
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            echo "sign $f"
+            codesign --force --sign - --timestamp=none "$f"
+          done < /tmp/machos_sorted.txt
+
+          echo "--- sign app bundle with entitlements ---"
+          codesign --force --sign - --timestamp=none --entitlements /tmp/ent.plist "$P"
           codesign -dv "$P" 2>&1 | head -12 || true
-          echo "--- entitlements ---"
           codesign -d --entitlements :- "$P" 2>/dev/null | head -20 || true
+
+          echo "--- hard assert LC_CODE_SIGNATURE ---"
           EXE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$P/Info.plist")
-          test -f "$P/$EXE" && echo "exe ok $EXE"
-          codesign -v "$P" && echo "codesign verify ok" || echo "codesign verify soft-fail"
+          FAILED=0
+          for f in "$P/$EXE" "$UF/UnityFramework"; do
+            if [ -f "$f" ]; then
+              if otool -l "$f" | grep -q LC_CODE_SIGNATURE; then
+                echo "signed ok  $f"
+              else
+                echo "NOT SIGNED $f"
+                FAILED=1
+              fi
+            fi
+          done
+          test "$FAILED" = "0"
+
           cd "$WORK"
           zip -0 -qry "/tmp/${APP_NAME}-trollstore.ipa" Payload
           ls -lh /tmp/*.ipa
           unzip -l "/tmp/${APP_NAME}-trollstore.ipa" > /tmp/ts_list.txt 2>&1 || true
-          TSENT=$(grep -c 'Payload/' /tmp/ts_list.txt || true)
-          echo "trollstore ipa entries=$TSENT"
-          test "$TSENT" -gt 50
+          echo "entries=$(grep -c 'Payload/' /tmp/ts_list.txt || true) codesig=$(grep -c '_CodeSignature' /tmp/ts_list.txt || true)"
+          grep -c 'Payload/' /tmp/ts_list.txt | xargs -I{} test {} -gt 50
     artifacts:
       - /tmp/*.ipa
       - /tmp/xcodebuild.log
